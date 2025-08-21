@@ -353,7 +353,10 @@ def build_general_mixture_components_per_chain(
 
         samp.append((comp1_s, comp2_s, comp3_s))
         logq.append((comp1_q, comp2_q, comp3_q))
-        W.append([0.5, 0.5, 0.5] if weights is None else list(weights[c]))
+        # Default to equal mixture weights when none are provided.  The previous
+        # values summed to more than one, effectively biasing the sampler.  Each
+        # component should receive an equal probability mass of one third.
+        W.append([1.0/3.0, 1.0/3.0, 1.0/3.0] if weights is None else list(weights[c]))
 
     return tuple(samp), tuple(logq), jnp.asarray(W)
 
