@@ -47,12 +47,49 @@ import Proposals  # your file with proposal factories
 
 # ------------------------- Utilities -------------------------
 
-def temperature_ladder(n_temps=50, T_min=1.0, T_max=100.0, kind="geom", cold_dense=False, power=2.0):
+def temperature_ladder(
+    n_temps: int = 50,
+    T_min: float = 1.0,
+    T_max: float = 100.0,
+    kind: str = "geom",
+    cold_dense: bool = False,
+    power: float = 2.0,
+):
+    """Construct a sequence of temperatures between ``T_min`` and ``T_max``.
+
+    Parameters
+    ----------
+    n_temps:
+        Number of temperatures in the ladder.
+    T_min:
+        Coldest temperature (typically 1.0).
+    T_max:
+        Hottest temperature.
+    kind:
+        Ladder scheme. Currently only ``"geom"`` (geometric spacing in ``T``)
+        is supported.
+    cold_dense:
+        If ``True``, densify near ``T_min`` by warping the index.
+    power:
+        Exponent used for warping when ``cold_dense`` is ``True``. Larger values
+        place more points near the cold chain.
+
+    Returns
+    -------
+    jnp.ndarray
+        Array of temperatures of length ``n_temps``.
+
+    Raises
+    ------
+    ValueError
+        If ``kind`` specifies an unsupported ladder scheme.
     """
-    kind: "geom" = geometric in T
-    cold_dense: if True, densify near T=1 by warping the index
-    power: >1 puts more points near the cold chain
-    """
+
+    if kind != "geom":
+        raise ValueError(
+            f"Unsupported ladder kind: {kind!r}. Only 'geom' is implemented."
+        )
+
     i = jnp.arange(n_temps, dtype=jnp.float32)
     if cold_dense:
         # warp indices to cluster more temperatures near i=0 (cold end)
