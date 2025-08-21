@@ -47,49 +47,12 @@ import Proposals  # your file with proposal factories
 
 # ------------------------- Utilities -------------------------
 
-def temperature_ladder(
-    n_temps: int = 50,
-    T_min: float = 1.0,
-    T_max: float = 100.0,
-    kind: str = "geom",
-    cold_dense: bool = False,
-    power: float = 2.0,
-):
-    """Construct a sequence of temperatures between ``T_min`` and ``T_max``.
-
-    Parameters
-    ----------
-    n_temps:
-        Number of temperatures in the ladder.
-    T_min:
-        Coldest temperature (typically 1.0).
-    T_max:
-        Hottest temperature.
-    kind:
-        Ladder scheme. Currently only ``"geom"`` (geometric spacing in ``T``)
-        is supported.
-    cold_dense:
-        If ``True``, densify near ``T_min`` by warping the index.
-    power:
-        Exponent used for warping when ``cold_dense`` is ``True``. Larger values
-        place more points near the cold chain.
-
-    Returns
-    -------
-    jnp.ndarray
-        Array of temperatures of length ``n_temps``.
-
-    Raises
-    ------
-    ValueError
-        If ``kind`` specifies an unsupported ladder scheme.
+def temperature_ladder(n_temps=50, T_min=1.0, T_max=100.0, kind="geom", cold_dense=False, power=2.0):
     """
-
-    if kind != "geom":
-        raise ValueError(
-            f"Unsupported ladder kind: {kind!r}. Only 'geom' is implemented."
-        )
-
+    kind: "geom" = geometric in T
+    cold_dense: if True, densify near T=1 by warping the index
+    power: >1 puts more points near the cold chain
+    """
     i = jnp.arange(n_temps, dtype=jnp.float32)
     if cold_dense:
         # warp indices to cluster more temperatures near i=0 (cold end)
@@ -196,74 +159,140 @@ class StepInfo(NamedTuple):
 #     return key, thetas2, logp2, do_swap
 
 
-def _apply_swaps_vec(arr, i, j, accept):
-    """
-    arr: (C, ...) values to swap
-    i,j: (K,) pair indices
-    accept: (K,) booleans
-    """
-    ai, aj = arr[i], arr[j]
-    if arr.ndim == 1:
-        arr = arr.at[i].set(jnp.where(accept, aj, ai))
-        arr = arr.at[j].set(jnp.where(accept, ai, aj))
-    else:
-        arr = arr.at[i].set(jnp.where(accept[:, None], aj, ai))
-        arr = arr.at[j].set(jnp.where(accept[:, None], ai, aj))
-    return arr
+# def _apply_swaps_vec(arr, i, j, accept):
+#     """
+#     arr: (C, ...) values to swap
+#     i,j: (K,) pair indices
+#     accept: (K,) booleans
+#     """
+#     ai, aj = arr[i], arr[j]
+#     acc = accept.astype(bool)
+#     if arr.ndim == 1:
+#         out = arr.at[i].set(jnp.where(acc, aj, ai))
+#         out = out.at[j].set(jnp.where(acc, ai, aj))
+#         return out
+#     else:
+#         # Expand mask to (K, 1, 1, ..., 1) to match ai/aj
+#         acc_b = acc.reshape(acc.shape + (1,)*(ai.ndim - 1))
+#         out = arr.at[i].set(jnp.where(acc_b, aj, ai))
+#         out = out.at[j].set(jnp.where(acc_b, ai, aj))
+#         return out
+
+# @jax.jit
+# def parallel_tempering_swap(key, temperatures, thetas, log_probs, *, return_debug=False):
+#     """
+#     One PT swap sweep (even or odd, chosen at random).
+#     temperatures: (C,)  *absolute T* (T0=1 is cold).  β = 1/T is computed inside.
+#     thetas:       (C,D)
+#     log_probs:    (C,)  untempered log π(θ) (includes prior!), not scaled by T.
+#     returns: key, thetas_new, log_probs_new, swap_decisions (C-1,) bool [, debug dict]
+#     """
+#     C = thetas.shape[0]
+#     beta = 1.0 / jnp.asarray(temperatures)
+#     n_edges = C - 1
+
+#     # Build even/odd adjacent index sets; pad odd to same static length
+#     i_even = jnp.arange(0, n_edges, 2, dtype=jnp.int32)   # Ke = ceil(n_edges/2)
+#     i_odd  = jnp.arange(1, n_edges, 2, dtype=jnp.int32)   # Ko = floor(n_edges/2)
+#     Ke = i_even.shape[0]
+#     Ko = i_odd.shape[0]
+#     pad = Ke - Ko
+#     i_odd_padded = jnp.concatenate([i_odd, -jnp.ones((pad,), dtype=jnp.int32)], axis=0)
+#     valid_even = jnp.ones((Ke,), dtype=bool)
+#     valid_odd  = jnp.arange(Ke) < Ko
+
+#     # RNG: advance key and get subkeys
+#     key, k_par = random.split(key)
+#     key, k_u   = random.split(key)
+#     parity = random.bernoulli(k_par)  # False->even, True->odd
+
+#     def pick_even():
+#         return i_even, valid_even
+#     def pick_odd():
+#         return i_odd_padded, valid_odd
+
+#     i_raw, valid = lax.cond(parity, pick_odd, pick_even)  # both (Ke,)
+#     # Safe indices for padded slots (map invalid to 0; we’ll mask later)
+#     i = jnp.where(valid, i_raw, jnp.zeros_like(i_raw))
+#     j = i + 1
+#     i = i.astype(jnp.int32)
+#     j = j.astype(jnp.int32)
+
+#     # Correct MH exponent for swaps: Δ = (β_i - β_j) * (lp_j - lp_i)
+#     delta = (beta[i] - beta[j]) * (log_probs[j] - log_probs[i])     # (Ke,)
+#     delta = jnp.where(valid, delta, -jnp.inf)                        # mask padded
+#     ulog  = jnp.log(random.uniform(k_u, shape=delta.shape))
+#     accept_sel = ulog < delta 
+#     accept_sel = accept_sel.astype(bool)                                       # (Ke,)
+
+#     # Apply swaps simultaneously on the selected (non-overlapping) pairs
+#     thetas_new = _apply_swaps_vec(thetas,    i, j, accept_sel)
+#     logp_new   = _apply_swaps_vec(log_probs, i, j, accept_sel)
+
+#     # Raster of decisions over all edges (C-1,)
+#     raster = jnp.zeros((n_edges,), dtype=bool).at[i].set(jnp.where(valid, accept_sel, False))
+
+#     if return_debug:
+#         dbg = {"delta": delta, "ulog": ulog, "pairs_i": i, "pairs_j": j, "accept_sel": accept_sel, "parity": parity}
+#         return key, thetas_new, logp_new, raster, dbg
+#     return key, thetas_new, logp_new, raster
 
 @jax.jit
 def parallel_tempering_swap(key, temperatures, thetas, log_probs, *, return_debug=False):
-    """
-    One PT swap sweep (even or odd, chosen at random).
-    temperatures: (C,)  *absolute T* (T0=1 is cold).  β = 1/T is computed inside.
-    thetas:       (C,D)
-    log_probs:    (C,)  untempered log π(θ) (includes prior!), not scaled by T.
-    returns: key, thetas_new, log_probs_new, swap_decisions (C-1,) bool [, debug dict]
-    """
     C = thetas.shape[0]
     beta = 1.0 / jnp.asarray(temperatures)
     n_edges = C - 1
 
-    # Build even/odd adjacent index sets; pad odd to same static length
-    i_even = jnp.arange(0, n_edges, 2, dtype=jnp.int32)   # Ke = ceil(n_edges/2)
-    i_odd  = jnp.arange(1, n_edges, 2, dtype=jnp.int32)   # Ko = floor(n_edges/2)
-    Ke = i_even.shape[0]
-    Ko = i_odd.shape[0]
-    pad = Ke - Ko
+    # even/odd pairs; pad odd to Ke
+    i_even = jnp.arange(0, n_edges, 2, dtype=jnp.int32)   # Ke
+    i_odd  = jnp.arange(1, n_edges, 2, dtype=jnp.int32)   # Ko
+    Ke     = i_even.shape[0]
+    Ko     = i_odd.shape[0]
+    pad    = Ke - Ko
     i_odd_padded = jnp.concatenate([i_odd, -jnp.ones((pad,), dtype=jnp.int32)], axis=0)
-    valid_even = jnp.ones((Ke,), dtype=bool)
-    valid_odd  = jnp.arange(Ke) < Ko
+    valid_even   = jnp.ones((Ke,), dtype=bool)
+    valid_odd    = jnp.arange(Ke) < Ko
 
-    # RNG: advance key and get subkeys
     key, k_par = random.split(key)
     key, k_u   = random.split(key)
-    parity = random.bernoulli(k_par)  # False->even, True->odd
+    parity = random.bernoulli(k_par)
 
-    def pick_even():
-        return i_even, valid_even
-    def pick_odd():
-        return i_odd_padded, valid_odd
+    i_raw, valid = lax.cond(parity, lambda: (i_odd_padded, valid_odd),
+                                     lambda: (i_even,       valid_even))  # (Ke,)
 
-    i_raw, valid = lax.cond(parity, pick_odd, pick_even)  # both (Ke,)
-    # Safe indices for padded slots (map invalid to 0; we’ll mask later)
-    i = jnp.where(valid, i_raw, jnp.zeros_like(i_raw))
-    j = i + 1
+    # safe indices; mask later
+    i = jnp.where(valid, i_raw, jnp.zeros_like(i_raw)).astype(jnp.int32)
+    j = (i + 1).astype(jnp.int32)
 
-    # Correct MH exponent for swaps: Δ = (β_i - β_j) * (lp_j - lp_i)
-    delta = (beta[i] - beta[j]) * (log_probs[j] - log_probs[i])     # (Ke,)
-    delta = jnp.where(valid, delta, -jnp.inf)                        # mask padded
+    # Δ = (β_i - β_j) * (lp_j - lp_i)
+    delta = (beta[i] - beta[j]) * (log_probs[j] - log_probs[i])        # (Ke,)
+    delta = jnp.where(valid, delta, -jnp.inf)                           # padded → always reject
     ulog  = jnp.log(random.uniform(k_u, shape=delta.shape))
-    accept_sel = ulog < delta                                        # (Ke,)
+    accept_sel = (ulog < delta) & valid                                 # (Ke,) bool
 
-    # Apply swaps simultaneously on the selected (non-overlapping) pairs
-    thetas_new = _apply_swaps_vec(thetas,    i, j, accept_sel)
-    logp_new   = _apply_swaps_vec(log_probs, i, j, accept_sel)
+    # --- inline swap (no external helper) ---
+    # For (C,D) arrays: expand mask to (Ke,1) to broadcast over D
+    def _swap_rows(arr):
+        ai, aj = arr[i], arr[j]   # (Ke, ...) same trailing shape as arr[0]
+        if arr.ndim == 1:
+            acc = accept_sel
+            arr = arr.at[i].set(jnp.where(acc, aj, ai))
+            arr = arr.at[j].set(jnp.where(acc, ai, aj))
+        else:
+            acc_b = accept_sel.reshape(accept_sel.shape + (1,)*(ai.ndim - 1))
+            arr = arr.at[i].set(jnp.where(acc_b, aj, ai))
+            arr = arr.at[j].set(jnp.where(acc_b, ai, aj))
+        return arr
 
-    # Raster of decisions over all edges (C-1,)
+    thetas_new = _swap_rows(thetas)         # (C,D)
+    logp_new   = _swap_rows(log_probs)      # (C,)
+
+    # decisions over all edges
     raster = jnp.zeros((n_edges,), dtype=bool).at[i].set(jnp.where(valid, accept_sel, False))
 
     if return_debug:
-        dbg = {"delta": delta, "ulog": ulog, "pairs_i": i, "pairs_j": j, "accept_sel": accept_sel, "parity": parity}
+        dbg = {"delta": delta, "ulog": ulog, "pairs_i": i, "pairs_j": j,
+               "accept_sel": accept_sel, "parity": parity}
         return key, thetas_new, logp_new, raster, dbg
     return key, thetas_new, logp_new, raster
 
