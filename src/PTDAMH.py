@@ -992,8 +992,12 @@ def run_epoch_device_fast_M23(
     fold_mask: jnp.ndarray | None = None,  # (D,) 0/1; None => no fold
     period: float = 1.0,
     do_swaps: bool = True,
+    extra_z_flips: int = 2,   # do 2 extra Gibbs flips on hot chains
+    T_hot: float = 2.0,       # chains with T > T_hot are considered "hot"
 ):
     C, D = init_state.thetas.shape
+    hot_mask = (temperatures > T_hot)            # (C,) bool
+    hot_mask_b = hot_mask[:, None]               # (C,1) for broadcasting to theta rows
 
     # indices
     idx1, idx2, idx3, idx_rest = _make_indices_equal_blocks(Npar_src, D)
@@ -1078,6 +1082,29 @@ def run_epoch_device_fast_M23(
             return args
 
         (th, z, lp) = lax.cond(do_m, _do, _skip, (th, z, lp))
+
+        # ---- EXTRA z flips for HOT chains only (cheap mixer) ----
+        # Do them only when we already did a stride update (keeps cost bounded).
+        def _extra_hot(args):
+            th_, z_, lp_, key_base = args
+
+            def one_flip(i, carry2):
+                thc, zc, lpc, kcur = carry2
+                kcur, kz2 = random.split(kcur)
+                th2, z2, lp2, _ = update_z_with_rejuv_local(kz2, thc, zc)
+                # apply only on hot chains
+                thc = jnp.where(hot_mask_b, th2, thc)
+                zc  = jnp.where(hot_mask,   z2,  zc)
+                lpc = jnp.where(hot_mask,   lp2, lpc)
+                return (thc, zc, lpc, kcur)
+
+            return lax.fori_loop(0, extra_z_flips, one_flip, (th_, z_, lp_, kZ))
+        
+        def _no_extra(args):
+            return args
+
+        (th, z, lp, _) = lax.cond(do_m, _extra_hot, _no_extra, (th, z, lp, kZ))
+
 
         # --- optional PT swap: swap θ, lp, and z coherently ---
         if do_swaps:
