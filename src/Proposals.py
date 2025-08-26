@@ -571,10 +571,6 @@ def build_general_mixture_components_per_chain(
 #         new_log_probs = jnp.where(accept, proposal_log_probs, state.log_probs)
 #         new_n_acc = state.n_accepted + accept.astype(int)
 
-#         # Parallel tempering swap
-#         key, new_thetas, new_log_probs, swap_acc, swap_dec = parallel_tempering_swap(
-#             subkey_swap, state.temperatures, new_thetas, new_log_probs
-#         )
 
 #         new_state = PTState(
 #             thetas=new_thetas,
