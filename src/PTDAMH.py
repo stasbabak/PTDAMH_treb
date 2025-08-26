@@ -25,7 +25,6 @@ This module expects your `Proposals.py` next to it. It does **not** modify
 from __future__ import annotations
 
 from dataclasses import dataclass
-from multiprocessing.util import info
 from typing import Callable, NamedTuple, Tuple, Sequence
 
 import jax
@@ -33,16 +32,9 @@ import jax.numpy as jnp
 from jax import lax, random, vmap
 import numpy as np
 from jax.scipy.linalg import solve_triangular
-from tqdm import tqdm
-from tqdm import trange
-
-
-import Proposals  # your file with proposal factories
-
 from tqdm import trange, tqdm
 
-
-import Proposals  # your file with proposal factories
+import Proposals  # your file with proposal factories  # noqa: F401
 
 
 # ------------------------- Utilities -------------------------
