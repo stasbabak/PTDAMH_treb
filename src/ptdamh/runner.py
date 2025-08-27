@@ -22,6 +22,7 @@ This module expects the proposal helpers in :mod:`ptdamh.proposals`. It does
 **not** modify those helpers. If you want to plug in different proposals,
 change only the `build_proposals(...)` function.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -43,230 +44,29 @@ from .proposals import (
     _pcn_logq_delta,
 )
 
+from .utilities import (
+    temperature_ladder,
+    _empirical_cov,
+    _shrink_spd,
+    _circular_mean,
+    _wrapped_diff,
+    _empirical_cov_wrapped,
+    PTState,
+    StepInfo,
+    _pt_swap_core,
+    _pt_swap_core_parity,
+    parallel_tempering_swap,
+    _batched_logprob_chunked_fn,
+    _fold_params,
+    _make_indices_equal_blocks,
+    _psi3_uniform_sample,
+    _psi3_uniform_logpdf,
+    _gather_cols,
+    _apply_swaps_vec,
+    make_logpost_M23,
+    update_z_with_rejuv,
+)
 
-# ------------------------- Utilities -------------------------
-
-def temperature_ladder(n_temps=50, T_min=1.0, T_max=100.0, kind="geom", cold_dense=False, power=2.0):
-    """
-    kind: "geom" = geometric in T
-    cold_dense: if True, densify near T=1 by warping the index
-    power: >1 puts more points near the cold chain
-    """
-    i = jnp.arange(n_temps, dtype=jnp.float32)
-    if cold_dense:
-        # warp indices to cluster more temperatures near i=0 (cold end)
-        i = ((i / (n_temps - 1)) ** power) * (n_temps - 1)
-    r = (T_max / T_min) ** (1.0 / (n_temps - 1))
-    T = T_min * (r ** i)
-    return T
-
-
-def _empirical_cov(x: np.ndarray, ddof: int = 1) -> np.ndarray:
-    x = np.asarray(x)
-    if x.shape[0] <= 1:
-        d = x.shape[1]
-        return np.eye(d, dtype=x.dtype) * 1e-3
-    return np.cov(x, rowvar=False, ddof=ddof)
-
-
-def _shrink_spd(cov_hat: np.ndarray, shrink: float = 0.1, jitter: float = 1e-6) -> np.ndarray:
-    cov_hat = np.asarray(cov_hat)
-    d = np.diag(np.diag(cov_hat))
-    cov = (1.0 - shrink) * cov_hat + shrink * d
-    cov = 0.5 * (cov + cov.T)
-    eps = float(max(np.max(np.diag(cov)), 1.0)) * jitter
-    cov += eps * np.eye(cov.shape[0], dtype=cov.dtype)
-    return cov
-
-def _circular_mean(vals, period=1.0):
-    ang = 2.0*np.pi*(vals/period)
-    c, s = np.cos(ang).mean(), np.sin(ang).mean()
-    mu_ang = np.arctan2(s, c) % (2*np.pi)
-    return mu_ang * (period/(2*np.pi))
-
-def _wrapped_diff(vals, mu, period=1.0):
-    d = vals - mu
-    return (d + 0.5*period) % period - 0.5*period
-
-def _empirical_cov_wrapped(samples, fold_idx=(), period=1.0, ddof=1):
-    X = np.asarray(samples)
-    T, D = X.shape
-    if T - ddof <= 0:
-        return np.eye(D), X.mean(axis=0) if T else np.zeros(D)
-    mu = X.mean(axis=0)
-    dev = X - mu
-    if fold_idx:
-        fold_idx = np.asarray(fold_idx, dtype=int)
-        for i in fold_idx:
-            mu_i = _circular_mean(X[:, i], period=period)
-            mu[i] = mu_i
-            dev[:, i] = _wrapped_diff(X[:, i], mu_i, period=period)
-        # re-center non-periodic with updated mu
-        nonper = np.setdiff1d(np.arange(D), fold_idx)
-        if nonper.size:
-            dev[:, nonper] = X[:, nonper] - mu[nonper]
-    C = (dev.T @ dev) / (T - ddof)
-    return C, mu
-
-
-# ------------------------- State & info -------------------------
-class PTState(NamedTuple):
-    thetas: jnp.ndarray        # (C, D)
-    log_probs: jnp.ndarray     # (C,)  (log-target at current thetas)
-    temperatures: jnp.ndarray  # (C,)
-    n_accepted: jnp.ndarray    # (C,)
-    n_swaps: jnp.ndarray       # (C-1,) counters of accepted swaps per edge (optional)
-    n_swap_attempts: jnp.ndarray  # (C-1,) total swap attempts per edge
-    z: jnp.ndarray | None = None   # (C,) int32, 0=M2, 1=M3
-
-
-class StepInfo(NamedTuple):
-    thetas_prop: jnp.ndarray      # (C, D)
-    logprob_prop: jnp.ndarray     # (C,)
-    accepted: jnp.ndarray         # (C,) bool
-    comp_idx: jnp.ndarray         # (C,) int in [0..K-1]
-    swap_decisions: jnp.ndarray   # (C-1,) bool
-
-
-# ------------------------- Parallel tempering swap -------------------------
-
-
-
-@jax.jit
-def _pt_swap_core(key, temperatures, thetas, log_probs):
-    C = thetas.shape[0]
-    beta = 1.0 / jnp.asarray(temperatures)
-    n_edges = C - 1
-
-    i_even = jnp.arange(0, n_edges, 2, dtype=jnp.int32)   # Ke
-    i_odd  = jnp.arange(1, n_edges, 2, dtype=jnp.int32)   # Ko
-    Ke     = i_even.shape[0]
-    Ko     = i_odd.shape[0]
-    pad    = Ke - Ko
-    i_odd_padded = jnp.concatenate([i_odd, -jnp.ones((pad,), dtype=jnp.int32)], axis=0)
-    valid_even   = jnp.ones((Ke,), dtype=bool)
-    valid_odd    = jnp.arange(Ke) < Ko
-
-    key, k_par = random.split(key)
-    key, k_u   = random.split(key)
-    parity = random.bernoulli(k_par)
-
-    i_raw, valid = jax.lax.cond(parity,
-                                lambda: (i_odd_padded, valid_odd),
-                                lambda: (i_even,       valid_even))  # (Ke,)
-
-    i = jnp.where(valid, i_raw, jnp.zeros_like(i_raw)).astype(jnp.int32)
-    j = (i + 1).astype(jnp.int32)
-
-    # Δ = (β_i - β_j) * (lp_j - lp_i)
-    delta = (beta[i] - beta[j]) * (log_probs[j] - log_probs[i])        # (Ke,)
-    delta = jnp.where(valid, delta, -jnp.inf)
-    ulog  = jnp.log(random.uniform(k_u, shape=delta.shape))
-    accept_sel = (ulog < delta) & valid                                 # (Ke,) bool
-
-    def _swap_rows(arr):
-        ai, aj = arr[i], arr[j]
-        if arr.ndim == 1:
-            acc = accept_sel
-            arr = arr.at[i].set(jnp.where(acc, aj, ai))
-            arr = arr.at[j].set(jnp.where(acc, ai, aj))
-        else:
-            acc_b = accept_sel.reshape(accept_sel.shape + (1,)*(ai.ndim - 1))
-            arr = arr.at[i].set(jnp.where(acc_b, aj, ai))
-            arr = arr.at[j].set(jnp.where(acc_b, ai, aj))
-        return arr
-
-    thetas_new = _swap_rows(thetas)         # (C,D)
-    logp_new   = _swap_rows(log_probs)      # (C,)
-
-    raster = jnp.zeros((n_edges,), dtype=bool).at[i].set(jnp.where(valid, accept_sel, False))
-    # Always return the raw debug arrays (no dicts inside jit)
-    return key, thetas_new, logp_new, raster, i, j, accept_sel, delta, ulog, parity
-
-@jax.jit
-def _pt_swap_core_parity(key, temperatures, thetas, log_probs, parity: jnp.bool_):
-    C = thetas.shape[0]
-    beta = 1.0 / jnp.asarray(temperatures)
-    n_edges = C - 1
-
-    i_even = jnp.arange(0, n_edges, 2, dtype=jnp.int32)   # Ke
-    i_odd  = jnp.arange(1, n_edges, 2, dtype=jnp.int32)   # Ko
-    Ke     = i_even.shape[0]
-    Ko     = i_odd.shape[0]
-    pad    = Ke - Ko
-    i_odd_padded = jnp.concatenate([i_odd, -jnp.ones((pad,), dtype=jnp.int32)], axis=0)
-    valid_even   = jnp.ones((Ke,), dtype=bool)
-    valid_odd    = jnp.arange(Ke) < Ko
-
-    # choose pair set deterministically via parity
-    i_raw, valid = jax.lax.cond(parity,
-                                lambda: (i_odd_padded, valid_odd),
-                                lambda: (i_even,       valid_even))  # (Ke,)
-
-    i = jnp.where(valid, i_raw, jnp.zeros_like(i_raw)).astype(jnp.int32)
-    j = (i + 1).astype(jnp.int32)
-
-    # draw uniforms for this pass
-    key, k_u = random.split(key)
-
-    # Δ = (β_i - β_j) * (lp_j - lp_i)
-    delta = (beta[i] - beta[j]) * (log_probs[j] - log_probs[i])
-    delta = jnp.where(valid, delta, -jnp.inf)
-    ulog  = jnp.log(random.uniform(k_u, shape=delta.shape))
-    accept_sel = (ulog < delta) & valid
-
-    def _swap_rows(arr):
-        ai, aj = arr[i], arr[j]
-        if arr.ndim == 1:
-            acc = accept_sel
-            arr = arr.at[i].set(jnp.where(acc, aj, ai))
-            arr = arr.at[j].set(jnp.where(acc, ai, aj))
-        else:
-            acc_b = accept_sel.reshape(accept_sel.shape + (1,)*(ai.ndim - 1))
-            arr = arr.at[i].set(jnp.where(acc_b, aj, ai))
-            arr = arr.at[j].set(jnp.where(acc_b, ai, aj))
-        return arr
-
-    thetas_new = _swap_rows(thetas)
-    logp_new   = _swap_rows(log_probs)
-
-    raster = jnp.zeros((n_edges,), dtype=bool).at[i].set(jnp.where(valid, accept_sel, False))
-    return key, thetas_new, logp_new, raster, i, j, accept_sel, delta, ulog
-
-
-def parallel_tempering_swap(key, temperatures, thetas, log_probs, *,
-                            return_debug=False, two_sweeps=True):
-    if not two_sweeps:
-        # your original single-sweep behavior
-        key2, th2, lp2, raster, i, j, acc_sel, delta, ulog, parity = _pt_swap_core(
-            key, temperatures, thetas, log_probs
-        )
-        if return_debug:
-            dbg = {"pairs_i": i, "pairs_j": j, "accept_sel": acc_sel,
-                   "delta": delta, "ulog": ulog, "parity": parity}
-            return key2, th2, lp2, raster, dbg
-        return key2, th2, lp2, raster
-
-    # -------- two sequential sweeps: EVEN then ODD --------
-    key, k1, k2 = random.split(key, 3)
-
-    # pass 1: EVEN (parity=False)
-    k1, th1, lp1, ras1, i1, j1, acc1, d1, u1 = _pt_swap_core_parity(
-        k1, temperatures, thetas, log_probs, parity=jnp.array(False)
-    )
-    # pass 2: ODD (parity=True), on the *permuted* arrays (no model calls)
-    k2, th2, lp2, ras2, i2, j2, acc2, d2, u2 = _pt_swap_core_parity(
-        k2, temperatures, th1, lp1, parity=jnp.array(True)
-    )
-
-    raster = ras1 | ras2
-    if return_debug:
-        dbg = {
-            "even": {"pairs_i": i1, "pairs_j": j1, "accept_sel": acc1, "delta": d1, "ulog": u1},
-            "odd":  {"pairs_i": i2, "pairs_j": j2, "accept_sel": acc2, "delta": d2, "ulog": u2},
-        }
-        return k2, th2, lp2, raster, dbg
-    return k2, th2, lp2, raster
 
 # ------------------------- Adaptive driver (m epochs) -------------------------
 @dataclass
@@ -274,7 +74,7 @@ class AdaptConfig:
     m_epochs: int = 6
     N_steps: int = 500
     target_accept: float = 0.234
-    eta: float = 0.05               # Robbins–Monro adaptation rate
+    eta: float = 0.05  # Robbins–Monro adaptation rate
     scale_init: float = 1.0
     scale_min: float = 0.1
     scale_max: float = 10.0
@@ -283,13 +83,14 @@ class AdaptConfig:
     kappa_line: float = 3.0
     beta_base: float = 0.3
     beta_temp_scale: bool = True
-    cov_mode: str = "rolling"      # "rolling" or "all_states"
-    window_size: int = 10_000       # rolling window size
-    downsample_every: int = 2       # store every k-th post-swap state into buffers
+    cov_mode: str = "rolling"  # "rolling" or "all_states"
+    window_size: int = 10_000  # rolling window size
+    downsample_every: int = 2  # store every k-th post-swap state into buffers
 
 
 class InfoAccumulator:
     """Accumulate per-epoch arrays into Python lists (kept out of JIT)."""
+
     def __init__(self):
         self.thetas_prop = []
         self.logprob_prop = []
@@ -304,10 +105,19 @@ class InfoAccumulator:
         self.accept_rate_per_epoch = []
         self.covs_per_epoch = []
         ### for product space
-        self._z_state = []     # optional
-        self._z_hist  = []     # optional
+        self._z_state = []  # optional
+        self._z_hist = []  # optional
 
-    def add(self, state: PTState, info: StepInfo, temps, scales, covs, z_hist_step=None, z_state_step=None):
+    def add(
+        self,
+        state: PTState,
+        info: StepInfo,
+        temps,
+        scales,
+        covs,
+        z_hist_step=None,
+        z_state_step=None,
+    ):
         # stack step-dimension on host
         self.thetas_prop.append(np.asarray(info.thetas_prop))
         self.logprob_prop.append(np.asarray(info.logprob_prop))
@@ -331,24 +141,54 @@ class InfoAccumulator:
 
     def pack(self):
         out = {
-            "thetas_prop": None if not self.thetas_prop else np.stack(self.thetas_prop, axis=0),
-            "logprob_prop": None if not self.logprob_prop else np.stack(self.logprob_prop, axis=0),
+            "thetas_prop": (
+                None if not self.thetas_prop else np.stack(self.thetas_prop, axis=0)
+            ),
+            "logprob_prop": (
+                None if not self.logprob_prop else np.stack(self.logprob_prop, axis=0)
+            ),
             "accepted": None if not self.accepted else np.stack(self.accepted, axis=0),
             "comp_idx": None if not self.comp_idx else np.stack(self.comp_idx, axis=0),
-            "swap_decisions": None if not self.swap_decisions else np.stack(self.swap_decisions, axis=0),
-            "thetas_state": None if not self.thetas_state else np.stack(self.thetas_state, axis=0),
-            "logprob_state": None if not self.logprob_state else np.stack(self.logprob_state, axis=0),
-            "temperatures": None if not self.temperatures else np.stack(self.temperatures, axis=0),
-            "scales_per_epoch": None if not self.scales_per_epoch else np.stack(self.scales_per_epoch, axis=0),
-            "swap_rate_per_epoch": None if not self.swap_rate_per_epoch else np.array(self.swap_rate_per_epoch),
-            "accept_rate_per_epoch": None if not self.accept_rate_per_epoch else np.stack(self.accept_rate_per_epoch, axis=0),
-            "covs_per_epoch": None if not self.covs_per_epoch else np.stack(self.covs_per_epoch, axis=0),
+            "swap_decisions": (
+                None
+                if not self.swap_decisions
+                else np.stack(self.swap_decisions, axis=0)
+            ),
+            "thetas_state": (
+                None if not self.thetas_state else np.stack(self.thetas_state, axis=0)
+            ),
+            "logprob_state": (
+                None if not self.logprob_state else np.stack(self.logprob_state, axis=0)
+            ),
+            "temperatures": (
+                None if not self.temperatures else np.stack(self.temperatures, axis=0)
+            ),
+            "scales_per_epoch": (
+                None
+                if not self.scales_per_epoch
+                else np.stack(self.scales_per_epoch, axis=0)
+            ),
+            "swap_rate_per_epoch": (
+                None
+                if not self.swap_rate_per_epoch
+                else np.array(self.swap_rate_per_epoch)
+            ),
+            "accept_rate_per_epoch": (
+                None
+                if not self.accept_rate_per_epoch
+                else np.stack(self.accept_rate_per_epoch, axis=0)
+            ),
+            "covs_per_epoch": (
+                None
+                if not self.covs_per_epoch
+                else np.stack(self.covs_per_epoch, axis=0)
+            ),
         }
         ## save product space evolution if present
         if self._z_state:
-            out["z_state"] = np.stack(self._z_state, axis=0)       # (E, C)
+            out["z_state"] = np.stack(self._z_state, axis=0)  # (E, C)
         if self._z_hist:
-            out["z_hist"] = np.stack(self._z_hist, axis=0)         # (E, T, C)
+            out["z_hist"] = np.stack(self._z_hist, axis=0)  # (E, T, C)
         # Also provide a flat dataset of proposed points if present
         if out["thetas_prop"] is not None:
             # Shapes: thetas_prop -> (E, T, C, D)
@@ -362,19 +202,24 @@ class InfoAccumulator:
             temps_epoch = out["temperatures"]  # (E, C)
             temps_rep = np.repeat(temps_epoch, T, axis=0)  # (E*T, C)
             temperature = temps_rep.reshape(E * T * C)
-            dataset = dict(X=X, y_logprob=y, accepted=acc, comp_idx=comp,
-                           chain=chain, temperature=temperature)
+            dataset = dict(
+                X=X,
+                y_logprob=y,
+                accepted=acc,
+                comp_idx=comp,
+                chain=chain,
+                temperature=temperature,
+            )
 
             # attach z aligned to proposals if available
             if "z_hist" in out:
-                dataset["z"] = out["z_hist"].reshape(E*T*C).astype(np.int8)
+                dataset["z"] = out["z_hist"].reshape(E * T * C).astype(np.int8)
 
             out["dataset"] = dataset
         return out
 
     def finalize(self):
         return self.pack()
-
 
 
 # ===== Device-resident, performance-first variant =====
@@ -392,60 +237,30 @@ from jax import random, lax, vmap
 
 # --- helpers ---
 
-def _batched_logprob_chunked_fn(log_prob_fn_single, C: int, D: int, chunk: int):
-    """Return jitted (X:(C,D)->(C,)) using pad+reshape+vmap with given chunk size."""
-    chunk = max(1, min(int(chunk), C))
-    n_chunks = (C + chunk - 1) // chunk
-    C_pad = n_chunks * chunk
-    pad_rows = C_pad - C
-    f1 = jax.vmap(log_prob_fn_single)
-    f2 = jax.vmap(f1)
-
-    @jax.jit
-    def run(X):  # (C, D)
-        if pad_rows:
-            pad = jnp.zeros((pad_rows, D), dtype=X.dtype)
-            Xp = jnp.concatenate([X, pad], axis=0)
-        else:
-            Xp = X
-        Yp = f2(Xp.reshape((n_chunks, chunk, D))).reshape((C_pad,))
-        return Yp[:C]
-    return run
-
-def _fold_params(x: jnp.ndarray, fold_mask: jnp.ndarray | None, period: float) -> jnp.ndarray:
-    """
-    Fold selected dimensions into [0, period). fold_mask: (D,) with {0,1}; None -> no-op.
-    Works inside jit without Python loops.
-    """
-    if fold_mask is None:
-        return x
-    x_mod = jnp.mod(x, period)
-    # broadcast mask to (C,D)
-    m = fold_mask[None, :]
-    return x * (1.0 - m) + x_mod * m
 
 # Build proposal components per chain.
 
 ################################################################################
 # --- core epoch ---
 
+
 def run_epoch_device_fast(
     key,
     init_state: PTState,
-    log_prob_fn_single,              # (D,) -> ()
-    temperatures: jnp.ndarray,       # (C,)
-    covs: jnp.ndarray,               # (C, D, D)
-    scale_small: jnp.ndarray,        # (C,)
-    scale_line: jnp.ndarray,         # (C,)
-    scale_big: jnp.ndarray,          # (C,)
-    comp_idx: jnp.ndarray,           # (C,) fixed for epoch in {0,1,2}
+    log_prob_fn_single,  # (D,) -> ()
+    temperatures: jnp.ndarray,  # (C,)
+    covs: jnp.ndarray,  # (C, D, D)
+    scale_small: jnp.ndarray,  # (C,)
+    scale_line: jnp.ndarray,  # (C,)
+    scale_big: jnp.ndarray,  # (C,)
+    comp_idx: jnp.ndarray,  # (C,) fixed for epoch in {0,1,2}
     n_steps: int,
     *,
-    lik_chunk: int = 32, 
-    means: jnp.ndarray,              # <-- (C,D) NEW (per-temperature means) 
+    lik_chunk: int = 32,
+    means: jnp.ndarray,  # <-- (C,D) NEW (per-temperature means)
     fold_mask: jnp.ndarray | None = None,  # (D,) with 0/1; None -> no folding
     period: float = 1.0,
-    do_swaps: bool = False
+    do_swaps: bool = False,
 ):
     """
     Fully device-resident epoch with symmetric proposals and fixed component per chain.
@@ -453,32 +268,44 @@ def run_epoch_device_fast(
     Returns final PTState and StepInfo (stacked over steps).
     """
     C, D = init_state.thetas.shape
-    fullcov, eigenline = _build_epoch_components(covs, scale_small, scale_line, scale_big)
+    fullcov, eigenline = _build_epoch_components(
+        covs, scale_small, scale_line, scale_big
+    )
     batched_lp = _batched_logprob_chunked_fn(log_prob_fn_single, C, D, lik_chunk)
 
     beta = 0.3
     nu = 5.0
+
     def body(carry, key_t):
         th, lp = carry  # (C, D), (C,)
         k0, k1, k2, k3, k4, kU, kS = random.split(key_t, 7)
 
-
         # 3 components
         # prop0 = _propose_fullcov(k0, th, fullcov["L_chol"], fullcov["scale_small"])   # (C, D)
-        prop0 = _propose_student_t(k0, k1, th, fullcov["L_chol"], fullcov["scale_small"], nu=nu)  # (C, D)
-        prop1 = _propose_eigenline(k2, k3, th, eigenline["U"], eigenline["S"],
-                                   eigenline["scale"], axis_logits=None) # (C, D)
-        prop2 = _propose_fullcov(k4, th, fullcov["L_chol"], fullcov["scale_big"])     # (C, D)
+        prop0 = _propose_student_t(
+            k0, k1, th, fullcov["L_chol"], fullcov["scale_small"], nu=nu
+        )  # (C, D)
+        prop1 = _propose_eigenline(
+            k2,
+            k3,
+            th,
+            eigenline["U"],
+            eigenline["S"],
+            eigenline["scale"],
+            axis_logits=None,
+        )  # (C, D)
+        prop2 = _propose_fullcov(
+            k4, th, fullcov["L_chol"], fullcov["scale_big"]
+        )  # (C, D)
         # prop2 = _propose_pcn(k4, th, means, fullcov["L_chol"], fullcov["scale_big"], beta=beta)
 
-
-        props_all = jnp.stack([prop0, prop1, prop2], axis=0)                      # (3, C, D)
-        proposals = props_all[comp_idx, jnp.arange(C), :]                         # (C, D)
+        props_all = jnp.stack([prop0, prop1, prop2], axis=0)  # (3, C, D)
+        proposals = props_all[comp_idx, jnp.arange(C), :]  # (C, D)
         proposals = _fold_params(proposals, fold_mask=fold_mask, period=period)
 
         # batched likelihood
-        prop_lp = batched_lp(proposals)        
-        
+        prop_lp = batched_lp(proposals)
+
         # Symmetric base (Student-t & eigen-line)
         delta = prop_lp - lp
         log_alpha = delta / temperatures
@@ -497,16 +324,18 @@ def run_epoch_device_fast(
         accept = u_log < log_alpha
 
         th_new = jnp.where(accept[:, None], proposals, th)
-        lp_new = jnp.where(accept,          prop_lp,     lp)
+        lp_new = jnp.where(accept, prop_lp, lp)
 
         # print (f'debug, lp = {lp}, prop_lp = {prop_lp}, accept = {accept}, comp_idx = {comp_idx}')
 
-         # ================= DEBUG START =================
-        delta = jnp.stack([prop_lp, lp, prop_lp - lp], axis=-1)                                          # (C,)
-        log_alpha = (prop_lp - lp) / temperatures                              # (C,)
-        u_log = jnp.log(random.uniform(kU, (C,)))                     # (C,)
-        accept = u_log < log_alpha                                    # (C,)
-        bad_accept = accept #& ~(u_log < log_alpha)                    # (C,) must be all False
+        # ================= DEBUG START =================
+        delta = jnp.stack([prop_lp, lp, prop_lp - lp], axis=-1)  # (C,)
+        log_alpha = (prop_lp - lp) / temperatures  # (C,)
+        u_log = jnp.log(random.uniform(kU, (C,)))  # (C,)
+        accept = u_log < log_alpha  # (C,)
+        bad_accept = (
+            accept  # & ~(u_log < log_alpha)                    # (C,) must be all False
+        )
         # ================= DEBUG END ===================
 
         # th_new = jnp.where(accept[:, None], proposals, th)
@@ -514,13 +343,15 @@ def run_epoch_device_fast(
 
         # PT swap (adjacent)
         if do_swaps:
-            _, th_sw, lp_sw, swap_dec = parallel_tempering_swap(kS, temperatures, th_new, lp_new)
+            _, th_sw, lp_sw, swap_dec = parallel_tempering_swap(
+                kS, temperatures, th_new, lp_new
+            )
         else:
             th_sw, lp_sw = th_new, lp_new
             swap_dec = jnp.zeros((C - 1,), dtype=bool)
 
         info_step = (proposals, prop_lp, accept, comp_idx, swap_dec)
-        dbg_step  = (delta, log_alpha, u_log, bad_accept)
+        dbg_step = (delta, log_alpha, u_log, bad_accept)
         return (th_sw, lp_sw), (info_step, dbg_step)
 
     keys = random.split(key, n_steps)
@@ -533,7 +364,7 @@ def run_epoch_device_fast(
     )
     # unpack step info
     (props, prop_lps, accepts, comp_idxs, swaps) = info_pack
-    (deltas, log_alphas, u_logs, bad_accept)     = dbg_pack
+    (deltas, log_alphas, u_logs, bad_accept) = dbg_pack
 
     final_state = PTState(
         thetas=th_f,
@@ -541,23 +372,25 @@ def run_epoch_device_fast(
         temperatures=init_state.temperatures,
         n_accepted=init_state.n_accepted + accepts.sum(axis=0).astype(jnp.int32),
         n_swaps=init_state.n_swaps + swaps.sum(axis=0).astype(jnp.int32),
-        n_swap_attempts=init_state.n_swap_attempts + jnp.full_like(init_state.n_swaps, n_steps),
+        n_swap_attempts=init_state.n_swap_attempts
+        + jnp.full_like(init_state.n_swaps, n_steps),
     )
 
     info = StepInfo(
-        thetas_prop=props,            # (T, C, D)
-        logprob_prop=prop_lps,        # (T, C)
-        accepted=accepts,             # (T, C)
-        comp_idx=comp_idxs,           # (T, C) replicates comp_idx per step
-        swap_decisions=swaps,         # (T, C-1)
+        thetas_prop=props,  # (T, C, D)
+        logprob_prop=prop_lps,  # (T, C)
+        accepted=accepts,  # (T, C)
+        comp_idx=comp_idxs,  # (T, C) replicates comp_idx per step
+        swap_decisions=swaps,  # (T, C-1)
     )
     debug = {
-        "delta": deltas,              # (T, C)
-        "log_alpha": log_alphas,      # (T, C)
-        "u_log": u_logs,              # (T, C)
-        "bad_accept": bad_accept,        # (T, C)
+        "delta": deltas,  # (T, C)
+        "log_alpha": log_alphas,  # (T, C)
+        "u_log": u_logs,  # (T, C)
+        "bad_accept": bad_accept,  # (T, C)
     }
     return final_state, info, debug
+
 
 ###################################################
 ############ updates for the product space ########
@@ -565,140 +398,61 @@ def run_epoch_device_fast(
 
 
 # --- indices for the 3 equal-sized signal blocks ---
-def _make_indices_equal_blocks(Npar_src: int, D: int):
-    i1 = jnp.arange(0,        Npar_src,      dtype=jnp.int32)
-    i2 = jnp.arange(Npar_src, 2*Npar_src,    dtype=jnp.int32)
-    i3 = jnp.arange(2*Npar_src,3*Npar_src,   dtype=jnp.int32)
-    # any remaining dims are "rest" (shared by both models)
-    if 3*Npar_src < D:
-        rest = jnp.arange(3*Npar_src, D, dtype=jnp.int32)
-    else:
-        rest = jnp.empty((0,), dtype=jnp.int32)
-    return i1, i2, i3, rest
-
-
-## Pseudo-prior
-def _psi3_uniform_sample(key, C, d3):
-    return random.uniform(key, (C, d3))
-
-def _psi3_uniform_logpdf(theta3):
-    # constant 0 inside [0,1]; you already fold/box -> we return zeros
-    return jnp.zeros((theta3.shape[0],), dtype=theta3.dtype)
 
 
 # ---------- product-space logposterior & z-Gibbs (+rejuvenation) ----------
 
-def _gather_cols(X, idx):            # X:(C,D), idx:(k,) -> (C,k) (works with k=0)
-    return jnp.take(X, idx, axis=1) if idx.size else jnp.zeros((X.shape[0], 0), X.dtype)
-
-def make_logpost_M23(
-    loglik_M2_single, loglik_M3_single,
-    idx1, idx2, idx3, idx_rest,
-    log_prior_z=(0.0, 0.0),
-    psi3_logpdf=_psi3_uniform_logpdf,
-):
-    f2 = jax.jit(jax.vmap(loglik_M2_single))
-    f3 = jax.jit(jax.vmap(loglik_M3_single))
-    lp0, lp1 = map(float, log_prior_z)
-
-    @jax.jit
-    def _logpost(X, z):
-        X1 = _gather_cols(X, idx1); X2 = _gather_cols(X, idx2)
-        X3 = _gather_cols(X, idx3); R  = _gather_cols(X, idx_rest)
-        lp2 = f2(jnp.concatenate([X1, X2, R], axis=1))
-        lp3 = f3(jnp.concatenate([X1, X2, X3, R], axis=1))
-        lp_psi3 = psi3_logpdf(X3)
-        return jnp.where(z.astype(bool), lp3 + lp1, lp2 + lp0 + lp_psi3)
-    return _logpost
-
-@jax.jit
-def update_z_with_rejuv(
-    key, X, z,
-    loglik_M2_single, loglik_M3_single,
-    idx1, idx2, idx3, idx_rest,
-    log_prior_z=(0.0,0.0),
-    psi3_sample=_psi3_uniform_sample,
-    psi3_logpdf=_psi3_uniform_logpdf,
-):
-    C, D = X.shape
-    k_rejuv, k_flip = random.split(key)
-    # rejuvenate θ3 ~ ψ when z==0
-    if idx3.size:
-        d3 = int(idx3.size)
-        fresh = psi3_sample(k_rejuv, C, d3)
-        X = X.at[:, idx3].set(jnp.where(z[:,None]==0, fresh, X[:, idx3]))
-
-    f2 = jax.vmap(loglik_M2_single); f3 = jax.vmap(loglik_M3_single)
-    X1 = _gather_cols(X, idx1); X2 = _gather_cols(X, idx2)
-    X3 = _gather_cols(X, idx3); R  = _gather_cols(X, idx_rest)
-
-    lp2 = f2(jnp.concatenate([X1, X2, R], axis=1))
-    lp3 = f3(jnp.concatenate([X1, X2, X3, R], axis=1))
-    lp_psi3 = psi3_logpdf(X3)
-    lp0, lp1 = map(float, log_prior_z)
-
-    logits = (lp3 + lp1) - (lp2 + lp0 + lp_psi3)
-    p1 = jax.nn.sigmoid(logits)
-    z_new = random.bernoulli(k_flip, p1).astype(jnp.int32)
-    lp_new = jnp.where(z_new.astype(bool), lp3 + lp1, lp2 + lp0 + lp_psi3)
-    return X, z_new, lp_new, p1
 
 ####################
-
-def _apply_swaps_vec(arr, i, j, accept):
-    ai, aj = arr[i], arr[j]
-    acc = accept.astype(bool)
-    if arr.ndim == 1:
-        out = arr.at[i].set(jnp.where(acc, aj, ai))
-        out = out.at[j].set(jnp.where(acc, ai, aj))
-        return out
-    else:
-        acc_b = acc.reshape(acc.shape + (1,)*(ai.ndim - 1))
-        out = arr.at[i].set(jnp.where(acc_b, aj, ai))
-        out = out.at[j].set(jnp.where(acc_b, ai, aj))
-        return out
-
 
 
 # ---------- the one-epoch product-space runner ----------
 
+
 def run_epoch_device_fast_M23(
     key,
-    init_state,                            # PTState with .thetas (C,D), .log_probs (C,), .z (C,)
-    temperatures: jnp.ndarray,             # (C,)
-    covs: jnp.ndarray,                     # (C,D,D)
-    scale_small: jnp.ndarray,              # (C,)
-    scale_line: jnp.ndarray,               # (C,)
-    scale_big: jnp.ndarray,                # (C,)
-    comp_idx: jnp.ndarray,                 # (C,) ∈ {0,1,2} fixed this epoch
+    init_state,  # PTState with .thetas (C,D), .log_probs (C,), .z (C,)
+    temperatures: jnp.ndarray,  # (C,)
+    covs: jnp.ndarray,  # (C,D,D)
+    scale_small: jnp.ndarray,  # (C,)
+    scale_line: jnp.ndarray,  # (C,)
+    scale_big: jnp.ndarray,  # (C,)
+    comp_idx: jnp.ndarray,  # (C,) ∈ {0,1,2} fixed this epoch
     n_steps: int,
     *,
-    Npar_src: int,                         # equal per-signal dimensionality
-    loglik_M2_single, loglik_M3_single,    # single-point fns
+    Npar_src: int,  # equal per-signal dimensionality
+    loglik_M2_single,
+    loglik_M3_single,  # single-point fns
     model_update_stride: int = 5,
-    log_prior_z = (0.0, 0.0),
-    psi3_sample = _psi3_uniform_sample,
-    psi3_logpdf = _psi3_uniform_logpdf,
+    log_prior_z=(0.0, 0.0),
+    psi3_sample=_psi3_uniform_sample,
+    psi3_logpdf=_psi3_uniform_logpdf,
     fold_mask: jnp.ndarray | None = None,  # (D,) 0/1; None => no fold
     period: float = 1.0,
     do_swaps: bool = True,
-    extra_z_flips: int = 2,   # do 2 extra Gibbs flips on hot chains
-    T_hot: float = 2.0,       # chains with T > T_hot are considered "hot"
+    extra_z_flips: int = 2,  # do 2 extra Gibbs flips on hot chains
+    T_hot: float = 2.0,  # chains with T > T_hot are considered "hot"
 ):
     C, D = init_state.thetas.shape
-    hot_mask = (temperatures > T_hot)            # (C,) bool
-    hot_mask_b = hot_mask[:, None]               # (C,1) for broadcasting to theta rows
+    hot_mask = temperatures > T_hot  # (C,) bool
+    hot_mask_b = hot_mask[:, None]  # (C,1) for broadcasting to theta rows
 
     # indices
     idx1, idx2, idx3, idx_rest = _make_indices_equal_blocks(Npar_src, D)
 
     # components (chol+eig on device)
-    fullcov, eigenline = _build_epoch_components(covs, scale_small, scale_line, scale_big)
+    fullcov, eigenline = _build_epoch_components(
+        covs, scale_small, scale_line, scale_big
+    )
 
     # product-space logposterior
     logpost = make_logpost_M23(
-        loglik_M2_single, loglik_M3_single,
-        idx1, idx2, idx3, idx_rest,
+        loglik_M2_single,
+        loglik_M3_single,
+        idx1,
+        idx2,
+        idx3,
+        idx_rest,
         log_prior_z=log_prior_z,
         psi3_logpdf=psi3_logpdf,
     )
@@ -709,69 +463,75 @@ def run_epoch_device_fast_M23(
     lp0, lp1 = float(log_prior_z[0]), float(log_prior_z[1])
 
     def swap_1d(arr, i, j, acc):
-        ai, aj = arr[i], arr[j]              # (K,)
+        ai, aj = arr[i], arr[j]  # (K,)
         out = arr.at[i].set(jnp.where(acc, aj, ai))
         out = out.at[j].set(jnp.where(acc, ai, aj))
         return out
 
-      # ----- local z-update + θ3 rejuvenation (NO function args) -----
+    # ----- local z-update + θ3 rejuvenation (NO function args) -----
     def update_z_with_rejuv_local(keyZ, X, z):
         k_rej, k_flip = random.split(keyZ)
         # rejuvenate θ3 ~ ψ3 for z==0
         if idx3.size:
             fresh3 = psi3_sample(k_rej, C, int(idx3.size))
-            X = X.at[:, idx3].set(jnp.where(z[:,None]==0, fresh3, X[:, idx3]))
+            X = X.at[:, idx3].set(jnp.where(z[:, None] == 0, fresh3, X[:, idx3]))
 
-        X1 = _gather_cols(X, idx1); X2 = _gather_cols(X, idx2)
-        X3 = _gather_cols(X, idx3); XR = _gather_cols(X, idx_rest)
+        X1 = _gather_cols(X, idx1)
+        X2 = _gather_cols(X, idx2)
+        X3 = _gather_cols(X, idx3)
+        XR = _gather_cols(X, idx_rest)
 
         lp2 = f2(jnp.concatenate([X1, X2, XR], axis=1))
         lp3 = f3(jnp.concatenate([X1, X2, X3, XR], axis=1))
         lp_psi3 = psi3_logpdf(X3)
 
         logits = (lp3 + lp1) - (lp2 + lp0 + lp_psi3)
-        beta   = 1.0 / temperatures                                # (C,) β = 1/T for each chain
-        p1  = jax.nn.sigmoid(beta * logits)                     # tempered conditional p(z=1|θ)
+        beta = 1.0 / temperatures  # (C,) β = 1/T for each chain
+        p1 = jax.nn.sigmoid(beta * logits)  # tempered conditional p(z=1|θ)
         # p1 = jax.nn.sigmoid(logits)
         z_new = random.bernoulli(k_flip, p1).astype(jnp.int32)
         lp_new = jnp.where(z_new.astype(bool), lp3 + lp1, lp2 + lp0 + lp_psi3)
         return X, z_new, lp_new, p1
 
-
     # stride mask for z-update
-    do_model = (jnp.arange(n_steps) % int(model_update_stride) == 0)
+    do_model = jnp.arange(n_steps) % int(model_update_stride) == 0
 
     def body(carry, xs):
         (th, lp, z), (key_t, do_m) = carry, xs
-        k0,k1,k2,k3,k4,kU,kS,kZ = random.split(key_t, 8)
+        k0, k1, k2, k3, k4, kU, kS, kZ = random.split(key_t, 8)
 
         z_at_prop = z
         # --- three full-state proposals (θ₃ moves regardless of z) ---
-        prop0 = _propose_student_t(k0, k1, th, fullcov["L_chol"], fullcov["scale_small"], nu=5.0)
-        prop1 = _propose_eigenline(k2, k3, th, eigenline["U"], eigenline["S"], eigenline["scale"])
-        prop2 = _propose_fullcov  (k4,     th, fullcov["L_chol"], fullcov["scale_big"])
-        props_all = jnp.stack([prop0, prop1, prop2], axis=0)          # (3,C,D)
-        proposals = props_all[comp_idx, jnp.arange(C), :]             # (C,D)
+        prop0 = _propose_student_t(
+            k0, k1, th, fullcov["L_chol"], fullcov["scale_small"], nu=5.0
+        )
+        prop1 = _propose_eigenline(
+            k2, k3, th, eigenline["U"], eigenline["S"], eigenline["scale"]
+        )
+        prop2 = _propose_fullcov(k4, th, fullcov["L_chol"], fullcov["scale_big"])
+        props_all = jnp.stack([prop0, prop1, prop2], axis=0)  # (3,C,D)
+        proposals = props_all[comp_idx, jnp.arange(C), :]  # (C,D)
 
         if fold_mask is not None:
             proposals = _fold_params(proposals, fold_mask=fold_mask, period=period)
 
         # --- MH under current z ---
-        prop_lp   = logpost(proposals, z_at_prop)                             # (C,)
-        delta     = prop_lp - lp
+        prop_lp = logpost(proposals, z_at_prop)  # (C,)
+        delta = prop_lp - lp
         log_alpha = delta / temperatures
-        u_log     = jnp.log(random.uniform(kU, (C,)))
-        accept    = u_log < log_alpha
+        u_log = jnp.log(random.uniform(kU, (C,)))
+        accept = u_log < log_alpha
 
-        th = jnp.where(accept[:,None], proposals, th)
-        lp = jnp.where(accept,        prop_lp,   lp)
-        snap_theta = (th, lp, z_at_prop) ### after theta proposal (fixed z)
+        th = jnp.where(accept[:, None], proposals, th)
+        lp = jnp.where(accept, prop_lp, lp)
+        snap_theta = (th, lp, z_at_prop)  ### after theta proposal (fixed z)
 
         # --- z-Gibbs (+ rejuvenation) on stride ---
         def _do(args):
             th_, z_, lp_ = args
             th2, z2, lp2, _ = update_z_with_rejuv_local(kZ, th_, z_)
             return (th2, z2, lp2)
+
         def _skip(args):
             return args
 
@@ -789,44 +549,58 @@ def run_epoch_device_fast_M23(
                 th2, z2, lp2, _ = update_z_with_rejuv_local(kz2, thc, zc)
                 # apply only on hot chains
                 thc = jnp.where(hot_mask_b, th2, thc)
-                zc  = jnp.where(hot_mask,   z2,  zc)
-                lpc = jnp.where(hot_mask,   lp2, lpc)
+                zc = jnp.where(hot_mask, z2, zc)
+                lpc = jnp.where(hot_mask, lp2, lpc)
                 return (thc, zc, lpc, kcur)
 
             return lax.fori_loop(0, extra_z_flips, one_flip, (th_, z_, lp_, kZ))
-        
+
         def _no_extra(args):
             return args
 
         (th, z, lp, _) = lax.cond(do_m, _extra_hot, _no_extra, (th, z, lp, kZ))
 
-
         # --- optional PT swap: swap θ, lp, and z coherently ---
         two_swaps = True
         if do_swaps:
-            key_s, th_sw, lp_sw, raster, dbg = parallel_tempering_swap(kS, temperatures, th, lp, return_debug=True, two_sweeps=two_swaps)
+            key_s, th_sw, lp_sw, raster, dbg = parallel_tempering_swap(
+                kS, temperatures, th, lp, return_debug=True, two_sweeps=two_swaps
+            )
             if two_swaps:
-                 # pass 1 (even):
-                i1, j1, acc1 = dbg["even"]["pairs_i"], dbg["even"]["pairs_j"], dbg["even"]["accept_sel"]
+                # pass 1 (even):
+                i1, j1, acc1 = (
+                    dbg["even"]["pairs_i"],
+                    dbg["even"]["pairs_j"],
+                    dbg["even"]["accept_sel"],
+                )
                 z1 = swap_1d(z, i1, j1, acc1)
                 # pass 2 (odd):
-                i2, j2, acc2 = dbg["odd"]["pairs_i"],  dbg["odd"]["pairs_j"],  dbg["odd"]["accept_sel"]
+                i2, j2, acc2 = (
+                    dbg["odd"]["pairs_i"],
+                    dbg["odd"]["pairs_j"],
+                    dbg["odd"]["accept_sel"],
+                )
                 z_sw = swap_1d(z1, i2, j2, acc2)
             else:
                 i, j, acc_sel = dbg["pairs_i"], dbg["pairs_j"], dbg["accept_sel"]
                 # swap z using the same decisions
-                z_sw = swap_1d(z, i, j, acc_sel)   ### state after PT swap -> th_sw, lp_sw, z_sw
+                z_sw = swap_1d(
+                    z, i, j, acc_sel
+                )  ### state after PT swap -> th_sw, lp_sw, z_sw
         else:
             th_sw, lp_sw = th, lp
-            raster = jnp.zeros((C-1,), dtype=bool)
+            raster = jnp.zeros((C - 1,), dtype=bool)
             z_sw = z
 
         # collect per-step info (keep interface)
         # info_step = (proposals, prop_lp, accept, comp_idx, raster, th_sw, z_sw, z_at_prop)
         info_step = (proposals, prop_lp, accept, comp_idx, raster, z_sw, z_at_prop)
-        dbg_step  = (jnp.stack([prop_lp, lp, delta], axis=-1), 
-                     log_alpha, u_log, accept & (u_log >= log_alpha))
-
+        dbg_step = (
+            jnp.stack([prop_lp, lp, delta], axis=-1),
+            log_alpha,
+            u_log,
+            accept & (u_log >= log_alpha),
+        )
 
         return (th_sw, lp_sw, z_sw), (info_step, dbg_step)
 
@@ -838,7 +612,9 @@ def run_epoch_device_fast_M23(
 
     # unpack
     # (props, prop_lps, accepts, comp_idxs, swaps, th_history, z_state_history, z_prop_history) = info_pack
-    (props, prop_lps, accepts, comp_idxs, swaps, z_state_history, z_prop_history) = info_pack
+    (props, prop_lps, accepts, comp_idxs, swaps, z_state_history, z_prop_history) = (
+        info_pack
+    )
     (deltas, log_alphas, u_logs, bad_acc) = dbg_pack
 
     # final state & info
@@ -848,40 +624,39 @@ def run_epoch_device_fast_M23(
         temperatures=init_state.temperatures,
         n_accepted=init_state.n_accepted + accepts.sum(axis=0).astype(jnp.int32),
         n_swaps=init_state.n_swaps + swaps.sum(axis=0).astype(jnp.int32),
-        n_swap_attempts=init_state.n_swap_attempts + jnp.full_like(init_state.n_swaps, n_steps),
-        z=z_f
+        n_swap_attempts=init_state.n_swap_attempts
+        + jnp.full_like(init_state.n_swaps, n_steps),
+        z=z_f,
     )
 
     StepInfoCls = StepInfo  # assume your existing dataclass
     info = StepInfoCls(
-        thetas_prop=props,            # (T, C, D)
-        logprob_prop=prop_lps,        # (T, C)
-        accepted=accepts,             # (T, C)
-        comp_idx=comp_idxs,           # (T, C)
-        swap_decisions=swaps,         # (T, C-1)
+        thetas_prop=props,  # (T, C, D)
+        logprob_prop=prop_lps,  # (T, C)
+        accepted=accepts,  # (T, C)
+        comp_idx=comp_idxs,  # (T, C)
+        swap_decisions=swaps,  # (T, C-1)
     )
 
     debug = {
-        "delta": deltas,              # (T, C, 3) [prop_lp, old_lp, diff]
-        "log_alpha": log_alphas,      # (T, C)
-        "u_log": u_logs,              # (T, C)
-        "bad_accept": bad_acc,        # (T, C) step
+        "delta": deltas,  # (T, C, 3) [prop_lp, old_lp, diff]
+        "log_alpha": log_alphas,  # (T, C)
+        "u_log": u_logs,  # (T, C)
+        "bad_accept": bad_acc,  # (T, C) step
     }
     # return final_state, info, th_history, z_state_history, z_prop_history, debug
-    return final_state, info,  z_state_history, z_prop_history, debug
-
-
-
+    return final_state, info, z_state_history, z_prop_history, debug
 
 
 # --- top-level adaptive runner (single-model OR product-space) ---
 
+
 def run_adaptive_pt_device_fast(
     key,
-    initial_thetas: jnp.ndarray,      # (C, D)
-    temperatures: jnp.ndarray,        # (C,)
-    log_prob_fn_single,               # (D,) -> ()   (ignored if product_space=True)
-    base_cov: np.ndarray,             # (D, D)
+    initial_thetas: jnp.ndarray,  # (C, D)
+    temperatures: jnp.ndarray,  # (C,)
+    log_prob_fn_single,  # (D,) -> ()   (ignored if product_space=True)
+    base_cov: np.ndarray,  # (D, D)
     *,
     fold_idx=(),
     period: float = 1.0,
@@ -889,16 +664,15 @@ def run_adaptive_pt_device_fast(
     cfg: AdaptConfig = AdaptConfig(),
     lik_chunk: int = 32,
     big_scale_factor: float = 3.0,
-
     # -------- NEW: product-space options (all optional) --------
-    product_space: bool = False,          # set True to use run_epoch_device_fast_M23
-    Npar_src: int | None = None,          # required if product_space=True
-    loglik_M2_single=None,                # required if product_space=True
-    loglik_M3_single=None,                # required if product_space=True
+    product_space: bool = False,  # set True to use run_epoch_device_fast_M23
+    Npar_src: int | None = None,  # required if product_space=True
+    loglik_M2_single=None,  # required if product_space=True
+    loglik_M3_single=None,  # required if product_space=True
     model_update_stride: int = 5,
-    log_prior_z = (0.0, 0.0),
-    psi3_sample = None,                   # defaults to uniform inside epoch if None
-    psi3_logpdf = None,                   # defaults to 0 inside [0,1]^d3 if None
+    log_prior_z=(0.0, 0.0),
+    psi3_sample=None,  # defaults to uniform inside epoch if None
+    psi3_logpdf=None,  # defaults to 0 inside [0,1]^d3 if None
     initial_z: np.ndarray | None = None,  # (C,), 0=M2, 1=M3; default all zeros
 ):
     """
@@ -913,14 +687,14 @@ def run_adaptive_pt_device_fast(
     """
     C, D = initial_thetas.shape
     acc_buffers = [np.empty((0, D), dtype=np.float64) for _ in range(C)]
-    means = np.asarray(initial_thetas)               # (C,D)
+    means = np.asarray(initial_thetas)  # (C,D)
     z_hist = None
 
     # Initialize covs/eigs
     covs = np.tile(np.asarray(base_cov)[None, :, :], (C, 1, 1))  # host np
     scales_small = jnp.full((C,), float(cfg.scale_init))
-    scales_line  = jnp.full((C,), float(cfg.scale_init) * cfg.kappa_line)
-    scales_big   = jnp.full((C,), float(cfg.scale_init) * big_scale_factor)
+    scales_line = jnp.full((C,), float(cfg.scale_init) * cfg.kappa_line)
+    scales_big = jnp.full((C,), float(cfg.scale_init) * big_scale_factor)
 
     # Fold mask
     fold_mask = None
@@ -945,18 +719,26 @@ def run_adaptive_pt_device_fast(
         )
     else:
         # --- product-space init ---
-        assert (Npar_src is not None) and (loglik_M2_single is not None) and (loglik_M3_single is not None), \
-            "When product_space=True, provide Npar_src, loglik_M2_single, loglik_M3_single."
-        z0 = np.zeros((C,), dtype=np.int32) if initial_z is None else np.asarray(initial_z, dtype=np.int32)
+        assert (
+            (Npar_src is not None)
+            and (loglik_M2_single is not None)
+            and (loglik_M3_single is not None)
+        ), "When product_space=True, provide Npar_src, loglik_M2_single, loglik_M3_single."
+        z0 = (
+            np.zeros((C,), dtype=np.int32)
+            if initial_z is None
+            else np.asarray(initial_z, dtype=np.int32)
+        )
 
         # slices for equal-sized blocks
         i1 = slice(0, Npar_src)
-        i2 = slice(Npar_src, 2*Npar_src)
-        i3 = slice(2*Npar_src, 3*Npar_src)
-        iR = slice(min(3*Npar_src, D), D)
+        i2 = slice(Npar_src, 2 * Npar_src)
+        i3 = slice(2 * Npar_src, 3 * Npar_src)
+        iR = slice(min(3 * Npar_src, D), D)
 
         def _concat2(X):  # M2 args
             return jnp.concatenate([X[:, i1], X[:, i2], X[:, iR]], axis=1)
+
         def _concat3(X):  # M3 args
             return jnp.concatenate([X[:, i1], X[:, i2], X[:, i3], X[:, iR]], axis=1)
 
@@ -966,8 +748,10 @@ def run_adaptive_pt_device_fast(
         lp3 = f3(_concat3(initial_thetas))
         lp0, lp1 = float(log_prior_z[0]), float(log_prior_z[1])
         # uniform pseudoprior ⇒ 0; if you pass psi3_logpdf, we can include it here too:
-        if psi3_logpdf is not None and (3*Npar_src) <= D:
-            lp_psi = jax.jit(lambda X3: jnp.zeros((X3.shape[0],), X3.dtype))  # safe default
+        if psi3_logpdf is not None and (3 * Npar_src) <= D:
+            lp_psi = jax.jit(
+                lambda X3: jnp.zeros((X3.shape[0],), X3.dtype)
+            )  # safe default
             try:
                 lp_psi = jax.jit(jax.vmap(psi3_logpdf))
             except Exception:
@@ -987,7 +771,7 @@ def run_adaptive_pt_device_fast(
             n_accepted=jnp.zeros((C,), dtype=jnp.int32),
             n_swaps=jnp.zeros((C - 1,), dtype=jnp.int32),
             n_swap_attempts=jnp.zeros((C - 1,), dtype=jnp.int32),
-            z=z0_j
+            z=z0_j,
         )
 
     info_accum = InfoAccumulator()
@@ -1001,44 +785,66 @@ def run_adaptive_pt_device_fast(
             W = np.hstack([W, np.zeros((C, 3 - W.shape[1]))])
         W /= np.clip(W.sum(axis=1, keepdims=True), 1e-32, None)
 
-    for epoch in trange(cfg.m_epochs, desc='Adaptive PT (device)', unit='epoch'):
-        covs_j = jnp.asarray(covs)                    # (C, D, D)
+    for epoch in trange(cfg.m_epochs, desc="Adaptive PT (device)", unit="epoch"):
+        covs_j = jnp.asarray(covs)  # (C, D, D)
 
         # component per chain for this epoch
-        comp_idx = np.array([np.random.choice(3, p=W[c]) for c in range(C)], dtype=np.int32)
+        comp_idx = np.array(
+            [np.random.choice(3, p=W[c]) for c in range(C)], dtype=np.int32
+        )
         comp_idx_j = jnp.asarray(comp_idx)
 
         # -------- run one epoch (branch: single vs product-space) --------
         key, subkey = random.split(key)
-    
+
         if not product_space:
             state, info, debug = run_epoch_device_fast(
-                subkey, state, log_prob_fn_single, temperatures,
-                covs_j, scales_small, scales_line, scales_big,
-                comp_idx_j, cfg.N_steps, lik_chunk=lik_chunk, means=means,
-                fold_mask=fold_mask, period=period, do_swaps=True
+                subkey,
+                state,
+                log_prob_fn_single,
+                temperatures,
+                covs_j,
+                scales_small,
+                scales_line,
+                scales_big,
+                comp_idx_j,
+                cfg.N_steps,
+                lik_chunk=lik_chunk,
+                means=means,
+                fold_mask=fold_mask,
+                period=period,
+                do_swaps=True,
             )
         else:
             # fall back to defaults inside epoch if psi3_* not provided
             ps_sample = psi3_sample if psi3_sample is not None else _psi3_uniform_sample
             ps_logpdf = psi3_logpdf if psi3_logpdf is not None else _psi3_uniform_logpdf
-    
-            state, info,  z_stat, z_hist, debug = run_epoch_device_fast_M23(
-                subkey, state, temperatures, covs_j,
-                scales_small, scales_line, scales_big,
-                comp_idx_j, cfg.N_steps,
+
+            state, info, z_stat, z_hist, debug = run_epoch_device_fast_M23(
+                subkey,
+                state,
+                temperatures,
+                covs_j,
+                scales_small,
+                scales_line,
+                scales_big,
+                comp_idx_j,
+                cfg.N_steps,
                 Npar_src=Npar_src,
                 loglik_M2_single=loglik_M2_single,
                 loglik_M3_single=loglik_M3_single,
                 model_update_stride=model_update_stride,
                 log_prior_z=log_prior_z,
-                psi3_sample=ps_sample, psi3_logpdf=ps_logpdf,
-                fold_mask=fold_mask, period=period, do_swaps=True
+                psi3_sample=ps_sample,
+                psi3_logpdf=ps_logpdf,
+                fold_mask=fold_mask,
+                period=period,
+                do_swaps=True,
             )
 
         # -------- accumulate accepted proposals per temperature --------
-        props = np.asarray(info.thetas_prop)              # (T_steps, C, D)
-        accs  = np.asarray(info.accepted, dtype=bool)     # (T_steps, C)
+        props = np.asarray(info.thetas_prop)  # (T_steps, C, D)
+        accs = np.asarray(info.accepted, dtype=bool)  # (T_steps, C)
         for c in range(C):
             Pc = props[accs[:, c], c, :]
             if Pc.size:
@@ -1048,10 +854,11 @@ def run_adaptive_pt_device_fast(
         acc_rate = jnp.asarray(info.accepted).mean(axis=0).astype(jnp.float64)
         scales_small = jnp.clip(
             jnp.exp(jnp.log(scales_small) + cfg.eta * (acc_rate - cfg.target_accept)),
-            cfg.scale_min, cfg.scale_max,
+            cfg.scale_min,
+            cfg.scale_max,
         )
         scales_line = jnp.clip(scales_line, cfg.scale_min, cfg.scale_max)
-        scales_big  = jnp.clip(scales_big,  cfg.scale_min, cfg.scale_max)
+        scales_big = jnp.clip(scales_big, cfg.scale_min, cfg.scale_max)
 
         # -------- adapt covariances (per temperature, all accepted so far) --------
         new_covs = []
@@ -1068,20 +875,29 @@ def run_adaptive_pt_device_fast(
                 )
             else:
                 cov_c = covs[c]
-                mu_hat = acc_buffers[c].mean(axis=0) if acc_buffers[c].size else np.zeros(D)
+                mu_hat = (
+                    acc_buffers[c].mean(axis=0) if acc_buffers[c].size else np.zeros(D)
+                )
             new_covs.append(cov_c)
             new_means.append(mu_hat)
 
-        covs  = np.stack(new_covs, axis=0)                  # (C, D, D)
+        covs = np.stack(new_covs, axis=0)  # (C, D, D)
         means = np.stack(new_means, axis=0)
 
         # -------- record epoch results --------
-        # info_accum.add(state, info, np.asarray(temperatures), 
+        # info_accum.add(state, info, np.asarray(temperatures),
         #                np.asarray(scales_small), covs, z_hist_step=np.asarray(z_hist))
 
         if product_space:
-            info_accum.add(state, info, np.asarray(temperatures), scales_small, covs, \
-                           z_hist_step=np.asarray(z_hist), z_state_step=np.asarray(z_stat))
+            info_accum.add(
+                state,
+                info,
+                np.asarray(temperatures),
+                scales_small,
+                covs,
+                z_hist_step=np.asarray(z_hist),
+                z_state_step=np.asarray(z_stat),
+            )
         else:
             info_accum.add(state, info, np.asarray(temperatures), scales_small, covs)
 
@@ -1091,16 +907,20 @@ def run_adaptive_pt_device_fast(
         if (epoch + 1) % 10 == 0 or epoch == cfg.m_epochs - 1:
             try:
                 from tqdm import tqdm as _tqdm
-                _tqdm.write(f"Epoch {epoch + 1}/{cfg.m_epochs} | "
-                            f"swap_rate={float(np.mean(np.asarray(info.swap_decisions))):.3f} | "
-                            f"mean_acc={float(np.mean(np.asarray(info.accepted))):.3f}" +
-                            (f" | p(z=1)={float(np.mean(state.z)):.3f}" if product_space else ""))
+
+                _tqdm.write(
+                    f"Epoch {epoch + 1}/{cfg.m_epochs} | "
+                    f"swap_rate={float(np.mean(np.asarray(info.swap_decisions))):.3f} | "
+                    f"mean_acc={float(np.mean(np.asarray(info.accepted))):.3f}"
+                    + (
+                        f" | p(z=1)={float(np.mean(state.z)):.3f}"
+                        if product_space
+                        else ""
+                    )
+                )
             except Exception:
                 pass
 
     out = info_accum.finalize()
     out["last_debug"] = last_debug
     return state, out
-
-
-
