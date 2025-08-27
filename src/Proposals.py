@@ -1,8 +1,5 @@
 
-
-### Here are two proposals
-
-# ================= Proposals: full-cov MVN and 1D eigen-line =================
+"""Proposal utilities for parallel tempering samplers."""
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -319,35 +316,22 @@ def build_general_mixture_components_per_chain(
     for c in range(n_chains):
         # temperature-dependent scales
         T = float(temperatures[c])
-        # s_small = float(scales_base[c] * jnp.sqrt(T))    # component 1
-        # s_line  = float(kappa_line * s_small)                          # component 2
         beta_c  = float(beta_base * (jnp.sqrt(T) if beta_temp_scale else 1.0))  # component 3 (pCN)
 
-        # comp 1: full-cov RW
-        # f_s, f_q = make_fullcov_proposal(jnp.asarray(covs[c]), fold_idx=fold_idx, period=period)
-        # comp1_s = (lambda key, x, n, sf=s_small, f=f_s: f(key, x, n, sf))
-        # comp1_q = (lambda newB, oldB, sf=s_small, q=f_q: q(newB, oldB, sf))
+        # component 1: Student-t random walk
         f_s, f_q = make_student_t_proposal(jnp.asarray(covs[c]), fold_idx=fold_idx, period=period, nu=5.0)
         comp1_s = (lambda key, x, n, sf=1.0, f=f_s: f(key, x, n, sf))
         comp1_q = (lambda newB, oldB, sf=1.0, q=f_q: q(newB, oldB, sf))
 
-        # comp 2: eigen-line (curvature-aligned big steps)
-        # e_s, e_q = make_eigenline_proposal(jnp.asarray(eig_U[c]), jnp.asarray(eig_S[c]),
-        #                                    fold_idx=fold_idx, period=period,
-        #                                    axis_probs=(jnp.sqrt(jnp.asarray(eig_S[c]))/
-        #                                                jnp.sum(jnp.sqrt(jnp.asarray(eig_S[c])))))
+        # component 2: eigen-line moves
         e_s, e_q = make_eigenline_proposal(jnp.asarray(eig_U[c]), jnp.asarray(eig_S[c]),
                                            fold_idx=fold_idx, period=period)
-        # comp2_s = (lambda key, x, n, sf=s_line, f=e_s: f(key, x, n, sf))
-        # comp2_q = (lambda newB, oldB, sf=s_line, q=e_q: q(newB, oldB, sf))
         comp2_s = (lambda key, x, n, sf=1.0, f=e_s: f(key, x, n, sf))
         comp2_q = (lambda newB, oldB, sf=1.0, q=e_q: q(newB, oldB, sf))
 
-        # comp 3: independence or pCN using running mean/cov
+        # component 3: pCN using running mean/cov
         mu_c = jnp.asarray(means_for_indep[c])
         g_s, g_q = make_pcn_proposal(mu_c, jnp.asarray(covs[c]), fold_idx=fold_idx, period=period, beta=beta_c)
-
-        #     g_s, g_q = make_independence_proposal(mu_c, jnp.asarray(covs[c]), fold_idx=fold_idx, period=period)
         comp3_s = (lambda key, x, n, sf=1.0, f=g_s: f(key, x, n, sf))
         comp3_q = (lambda newB, oldB, sf=1.0, q=g_q: q(newB, oldB, sf))
 
@@ -361,266 +345,3 @@ def build_general_mixture_components_per_chain(
     return tuple(samp), tuple(logq), jnp.asarray(W)
 
 
-
-
-# def run_adaptive_3pro_mix_ptmcmc(
-#     key,
-#     initial_thetas: jnp.ndarray,      # (n_chains, dim)
-#     temperatures: jnp.ndarray,        # (n_chains,)
-#     true_logprob_fn,
-#     base_cov: np.ndarray,             # (dim, dim)
-#     fold_idx=(),
-#     period=1.0,
-#     m_epochs: int = 6,
-#     N_steps: int = 500,
-#     target_accept: float = 0.234,
-#     eta: float = 0.05,                # Robbins–Monro step for RW/eigen scales
-#     scale_init: float = 1.0,
-#     scale_min: float = 0.1,
-#     scale_max: float = 10.0,
-#     shrink: float = 0.1,
-#     jitter: float = 1e-6,
-#     kappa_line: float = 3.0,
-#     beta_base: float = 0.3,
-#     beta_temp_scale: bool = True,
-#     init_weights: np.ndarray | None = None,  # (n_chains, 3)
-# ):
-#     """
-#     Per-chain adaptation with a 3-component mixture per chain: full-cov, eigen-line, pCN.
-#     Returns:
-#       state, covs(list), eig_U(list), eig_S(list), scales(np.ndarray), weights(jnp.ndarray), means(list), history(dict)
-#     """
-#     # --- init per-chain structures ---
-#     key = jax.random.PRNGKey(int(key[0]) if isinstance(key, jnp.ndarray) else key)
-#     initial_thetas = jnp.asarray(initial_thetas); temperatures = jnp.asarray(temperatures)
-#     n_chains, dim = initial_thetas.shape
-
-#     base_cov = _shrink_spd(np.asarray(base_cov, dtype=np.float64), shrink=shrink, jitter=jitter)
-#     covs = [base_cov.copy() for _ in range(n_chains)]
-#     eig_U, eig_S = [], []
-#     for c in range(n_chains):
-#         Uc, Sc = _eig_from_cov(covs[c]); eig_U.append(Uc); eig_S.append(Sc)
-
-#     # per-chain RW/eigen scale
-#     scales = np.full((n_chains,), float(scale_init), dtype=np.float64)
-
-#     # per-chain mixture weights
-#     if init_weights is None:
-#         init_weights = np.tile(np.array([0.6, 0.25, 0.15], dtype=np.float64), (n_chains, 1))
-#     else:
-#         init_weights = np.asarray(init_weights, dtype=np.float64)
-#         assert init_weights.shape == (n_chains, 3)
-#     init_weights = init_weights / init_weights.sum(axis=1, keepdims=True)
-#     weights = jnp.asarray(init_weights)
-
-#     # simple per-chain running mean (for pCN/independence); start at initial thetas
-#     means = [np.array(initial_thetas[c]) for c in range(n_chains)]
-#     mean_ema = 0.9  # EMA coefficient
-
-#     # --- build components & run one step to init state ---
-#     props, logqs, weights = build_general_mixture_components_per_chain(
-#         covs, eig_U, eig_S, means, temperatures, scales,
-#         fold_idx=fold_idx, period=period,
-#         kappa_line=kappa_line,
-#         beta_base=beta_base, beta_temp_scale=beta_temp_scale,
-#         weights=weights
-#     )
-#     key, subkey = jax.random.split(key)
-#     final_state, states, infos = PTwarmup_collect_mixture(
-#         subkey, initial_thetas, temperatures, true_logprob_fn,
-#         props, logqs, weights, n_steps=1
-#     )
-#     state = final_state
-
-#     history = {"accept_rate": [], "scale": [], "swap_rate": [], "cov_diag": [], "weights": []}
-
-#     for epoch in range(m_epochs):
-#         # --- run N steps with current mixture ---
-#         key, subkey = jax.random.split(key)
-#         final_state, states, infos = PTwarmup_collect_mixture(
-#             subkey, state.thetas, state.temperatures, true_logprob_fn,
-#             props, logqs, weights, n_steps=N_steps
-#         )
-#         state = final_state
-
-#         # --- per-chain acceptance & accepted points ---
-#         acc_pts_list, acc_rates = _extract_accepted_points_per_chain(infos)
-#         last_states = np.array(states.thetas[-1])  # (n_chains, dim)
-
-#         # update per-chain running mean (for pCN)
-#         for c in range(n_chains):
-#             means[c] = mean_ema * means[c] + (1.0 - mean_ema) * last_states[c]
-
-#         # update per-chain covariance & eigenbasis
-#         for c in range(n_chains):
-#             Xc = last_states[c : c+1, :] if acc_pts_list[c].size == 0 \
-#                  else np.vstack([last_states[c : c+1, :], acc_pts_list[c]])
-#             cov_hat_c = _empirical_cov(Xc, ddof=1)
-#             covs[c]   = _shrink_spd(cov_hat_c, shrink=shrink, jitter=jitter)
-#             eig_U[c], eig_S[c] = _eig_from_cov(covs[c])
-
-#         # Robbins–Monro scale for RW/eigen (per chain)
-#         scales = np.clip(scales * np.exp(eta * (acc_rates - target_accept)), scale_min, scale_max)
-
-#         # (optional) adapt mixture weights by component success; keep fixed for now
-#         # Example to lift a component’s weight if it produced many accepts:
-#         # comp = np.array(infos["comp_idx"])   # (N_steps, n_chains)
-#         # acc  = np.array(infos["accepted"])   # (N_steps, n_chains)
-#         # ... compute per-chain accepted-per-component and do an EMA toward that ...
-
-#         # rebuild components with updated covs/eigs/means/scales
-#         props, logqs, weights = build_general_mixture_components_per_chain(
-#             covs, eig_U, eig_S, means, temperatures, scales,
-#             fold_idx=fold_idx, period=period,
-#             kappa_line=kappa_line,
-#             beta_base=beta_base, beta_temp_scale=beta_temp_scale,
-#             weights=weights
-#         )
-
-#         # diagnostics
-#         swap_dec = np.array(infos["swap_decisions"])
-#         swap_rate = swap_dec.mean().item() if swap_dec.size else 0.0
-#         history["accept_rate"].append(acc_rates.copy())
-#         history["scale"].append(scales.copy())
-#         history["swap_rate"].append(swap_rate)
-#         history["cov_diag"].append(np.stack([np.diag(C) for C in covs], axis=0))
-#         history["weights"].append(np.array(weights))
-
-#     return state, covs, eig_U, eig_S, scales, weights, means, history
-
-
-# def PTwarmup_collect_mixture(
-#     key,
-#     initial_thetas: jnp.ndarray,   # (n_chains, dim)
-#     temperatures: jnp.ndarray,     # (n_chains,)
-#     log_prob_fn: Callable,         # function(theta) -> logpi(theta)
-#     proposal_fns_per_chain: tuple, # len n_chains; each is tuple of sample_fns
-#     logq_fns_per_chain: tuple,     # len n_chains; each is tuple of logq_fns
-#     weights: jnp.ndarray,          # (n_chains, n_components)
-#     n_steps: int
-# ):
-#     """
-#     Parallel tempering warmup loop with per-chain mixture proposals.
-
-#     proposal_fns_per_chain[c][k](key, theta, n, scale) -> (n, dim) proposals
-#     logq_fns_per_chain[c][k](theta_new_batch, theta_old_batch, scale) -> (n,) logq
-#     weights[c][k] is prob. of picking component k for chain c.
-#     """
-
-#     n_chains, dim = initial_thetas.shape
-#     n_comp = weights.shape[1]
-
-#     class PTState(NamedTuple):
-#         thetas: jnp.ndarray       # (n_chains, dim)
-#         log_probs: jnp.ndarray    # (n_chains,)
-#         temperatures: jnp.ndarray # (n_chains,)
-#         n_accepted: jnp.ndarray   # (n_chains,)
-#         n_swaps: int
-#         n_swap_attempts: int
-
-#     # --- init log_probs ---
-#     initial_log_probs = jax.vmap(log_prob_fn)(initial_thetas)
-#     state0 = PTState(
-#         thetas=initial_thetas,
-#         log_probs=initial_log_probs,
-#         temperatures=temperatures,
-#         n_accepted=jnp.zeros(n_chains, dtype=int),
-#         n_swaps=0,
-#         n_swap_attempts=0
-#     )
-
-#     def one_step(carry, key):
-#         state = carry
-#         key, subkey_comp, subkey_prop, subkey_acc, subkey_swap = jax.random.split(key, 5)
-
-#         # Pick component index for each chain
-#         comp_idx = jax.vmap(
-#             lambda w, k: random.categorical(k, jnp.log(w))
-#         )(weights, random.split(subkey_comp, n_chains))  # (n_chains,)
-
-#         # Draw proposals
-#         def propose_for_chain(c_idx, chain_idx, key, theta):
-#             sample_fn = proposal_fns_per_chain[chain_idx][c_idx]
-#             return sample_fn(key, theta, 1, 1.0)[0]  # take shape (dim,)
-
-#         keys_prop = random.split(subkey_prop, n_chains)
-#         proposals = jax.vmap(propose_for_chain)(comp_idx, jnp.arange(n_chains), keys_prop, state.thetas)
-
-#         # Compute logq forward and backward
-#         def logq_for_chain(c_idx, chain_idx, theta_new, theta_old):
-#             logq_fn = logq_fns_per_chain[chain_idx][c_idx]
-#             return logq_fn(theta_new[None, :], theta_old[None, :], 1.0)[0]
-
-#         logq_forward = jax.vmap(logq_for_chain)(comp_idx, jnp.arange(n_chains), proposals, state.thetas)
-#         logq_backward = jax.vmap(logq_for_chain)(comp_idx, jnp.arange(n_chains), state.thetas, proposals)
-
-#         # Compute log_probs for proposals
-#         proposal_log_probs = jax.vmap(log_prob_fn)(proposals)
-
-#         # Tempered log_probs
-#         tempered_current = state.log_probs / state.temperatures
-#         tempered_proposal = proposal_log_probs / state.temperatures
-
-#         # MH acceptance
-#         log_alpha = tempered_proposal - tempered_current + logq_backward - logq_forward
-#         alpha = jnp.minimum(1.0, jnp.exp(log_alpha))
-#         accept = random.uniform(subkey_acc, shape=(n_chains,)) < alpha
-
-#         # Update
-#         new_thetas = jnp.where(accept[:, None], proposals, state.thetas)
-#         new_log_probs = jnp.where(accept, proposal_log_probs, state.log_probs)
-#         new_n_acc = state.n_accepted + accept.astype(int)
-
-
-#         new_state = PTState(
-#             thetas=new_thetas,
-#             log_probs=new_log_probs,
-#             temperatures=state.temperatures,
-#             n_accepted=new_n_acc,
-#             n_swaps=state.n_swaps + swap_acc.astype(int),
-#             n_swap_attempts=state.n_swap_attempts + 1
-#         )
-
-#         info = {
-#             "accepted": accept,
-#             "comp_idx": comp_idx,
-#             "swap_decisions": swap_dec
-#         }
-#         return new_state, info
-
-#     keys = random.split(key, n_steps)
-#     final_state, infos = jax.lax.scan(one_step, state0, keys)
-#     return final_state, infos
-
-
-# class ResBlock(nn.Module):
-#     width: int
-#     dropout: float = 0.0
-#     @nn.compact
-#     def __call__(self, x, train: bool): 
-#         h = nn.LayerNorm()(h)
-#         h = nn.Dense(self.width)(x)  # Moved here
-#         h = nn.gelu(h)
-#         if self.dropout > 0:
-#             h = nn.Dropout(self.dropout)(h, deterministic=not train)
-#         h = nn.Dense(self.width)(h)
-#         return x + h
-
-# class LogProbNet(nn.Module):
-#     widths: Sequence[int] = (512, 512, 512, 512)   # Base
-#     blocks_per_layer: int = 2
-#     dropout: float = 0.0
-#     heteroscedastic: bool = False
-#     @nn.compact
-#     def __call__(self, x, train: bool = True):
-#         x = nn.LayerNorm()(x)
-#         h = nn.Dense(self.widths[0])(x)
-#         for w in self.widths:
-#             for _ in range(self.blocks_per_layer):
-#                 h = ResBlock(w, dropout=self.dropout)(h, train=train)
-#         if self.heteroscedastic:
-#             out = nn.Dense(2)(h)
-#             mu, log_var = out[...,0], jnp.clip(out[..., 1], -12.0, 5.0)
-#             return mu, log_var
-#         else:
-#             return nn.Dense(1)(h).squeeze(-1)
