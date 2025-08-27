@@ -2,10 +2,11 @@
 """Proposal utilities for parallel tempering samplers."""
 import jax
 import jax.numpy as jnp
-from jax import random
+from jax import random, vmap
 import jax.scipy as jsp
 import numpy as np
 from jax.scipy.special import gammaln
+from jax.scipy.linalg import solve_triangular
 
 
 # ---------- helpers ----------
@@ -343,5 +344,117 @@ def build_general_mixture_components_per_chain(
         W.append([1.0/3.0, 1.0/3.0, 1.0/3.0] if weights is None else list(weights[c]))
 
     return tuple(samp), tuple(logq), jnp.asarray(W)
+
+
+# ---------------------------------------------------------------------------
+# Proposal helpers originally defined in ``runner.py``
+
+
+def _build_epoch_components(
+    covs: jnp.ndarray,
+    scale_small: jnp.ndarray,
+    scale_line: jnp.ndarray,
+    scale_big: jnp.ndarray,
+    jitter: float = 1e-9,
+):
+    """Construct per-chain proposal components for an epoch.
+
+    Parameters
+    ----------
+    covs: (C, D, D)
+        Empirical covariance matrices for each chain.
+    scale_small, scale_line, scale_big: (C,)
+        Per-chain scale factors for the full-covariance, eigen-line and
+        "big" proposal components respectively.
+    jitter: float, optional
+        Diagonal jitter added for numerical stability.
+
+    Returns
+    -------
+    fullcov, eigenline : dict
+        Dictionaries with pre-computed quantities used by the proposal
+        factories in :func:`run_epoch_device_fast`.
+    """
+
+    C, D, _ = covs.shape
+    I = jnp.eye(D)[None, :, :]
+    sym = 0.5 * (covs + jnp.swapaxes(covs, -1, -2)) + jitter * I
+
+    L_chol = jnp.linalg.cholesky(sym)  # (C, D, D)
+
+    S, U = jnp.linalg.eigh(sym)
+    S = jnp.clip(S, 1e-12, None)
+    axis_logits = jnp.log(jnp.sqrt(S) + 1e-12)
+
+    fullcov = {
+        "L_chol": L_chol,
+        "scale_small": scale_small,
+        "scale_big": scale_big,
+    }
+    eigenline = {"U": U, "S": S, "axis_logits": axis_logits, "scale": scale_line}
+    return fullcov, eigenline
+
+
+def _propose_fullcov(key, x, L, scale):
+    """Full-covariance Gaussian random walk proposal."""
+    C, D = x.shape
+    cd_const = 2.38 / jnp.sqrt(D) * 0.5
+    z = random.normal(key, x.shape)
+    step = jnp.einsum("cij,cj->ci", L, z)
+    return x + cd_const * step
+
+
+def _propose_eigenline(key_axis, key_noise, x, U, S, scale, axis_logits=None):
+    """Propose along a single eigen-direction for each chain."""
+    C, D = x.shape
+    if axis_logits is None:
+        axes = random.randint(key_axis, shape=(C,), minval=0, maxval=D)
+    else:
+        axes = vmap(lambda lg, k: random.categorical(k, lg))(axis_logits, random.split(key_axis, C))
+
+    Usel = jnp.take_along_axis(U, axes[:, None, None], axis=2).squeeze(-1)
+    Ssel = jnp.take_along_axis(S, axes[:, None], axis=1).squeeze(-1)
+    r = random.normal(key_noise, (C,))
+    step = (jnp.sqrt(Ssel) * r)[:, None] * Usel
+    return x + step
+
+
+def _propose_student_t(key_norm, key_gamma, x, L, scale, nu=5.0):
+    """Student-t random walk proposal."""
+    C, D = x.shape
+    cd_const = 2.38 / jnp.sqrt(D) * 0.5
+    z = random.normal(key_norm, (C, D))
+    g = random.gamma(key_gamma, a=(nu if jnp.ndim(nu) == 0 else nu[:, None]) / 2.0, shape=(C, 1))
+    g = g * (2.0 / (nu if jnp.ndim(nu) == 0 else nu[:, None]))
+    t = z / jnp.sqrt(g)
+    step = cd_const * jnp.einsum("cij,cj->ci", L, t)
+    return x + step
+
+
+def _propose_pcn(key, x, mu, L, scale, beta=0.3):
+    """Preconditioned Crank–Nicolson proposal."""
+    b = (beta if jnp.ndim(beta) == 0 else beta) * (scale if jnp.ndim(scale) == 0 else scale)
+    alpha = jnp.sqrt(1.0 - b**2)
+    eps = jnp.einsum("cij,cj->ci", L, random.normal(key, x.shape))
+    return alpha[:, None] * x + b[:, None] * eps + (1.0 - alpha)[:, None] * mu
+
+
+def _pcn_logq_delta(x, y, mu, L, scale, beta=0.3):
+    """Difference in log proposal densities for pCN proposals."""
+    b = (beta if jnp.ndim(beta) == 0 else beta) * (scale if jnp.ndim(scale) == 0 else scale)
+    b2 = jnp.clip(b * b, 1e-12, 1.0 - 1e-12)
+    a = jnp.sqrt(1.0 - b2)
+
+    m_x = a[:, None] * x + (1.0 - a)[:, None] * mu
+    m_y = a[:, None] * y + (1.0 - a)[:, None] * mu
+
+    def maha_sq(Lc, v):
+        w = solve_triangular(Lc, v, lower=True)
+        return jnp.sum(w * w)
+
+    maha_y_given_x = vmap(maha_sq)(L, (y - m_x))
+    maha_x_given_y = vmap(maha_sq)(L, (x - m_y))
+    return -0.5 * (maha_x_given_y - maha_y_given_x) / (b * b + 1e-32)
+
 
 
