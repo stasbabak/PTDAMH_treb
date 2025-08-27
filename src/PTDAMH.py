@@ -35,6 +35,7 @@ import numpy as np
 from tqdm import trange, tqdm
 
 import Proposals  # your file with proposal factories
+from utils import _apply_swaps_vec, parallel_tempering_swap
 
 
 # ------------------------- Utilities -------------------------
@@ -157,107 +158,6 @@ class StepInfo(NamedTuple):
     swap_decisions: jnp.ndarray   # (C-1,) bool
 
 
-# ------------------------- Parallel tempering swap -------------------------
-# @jax.jit
-# def parallel_tempering_swap(key, temperatures: jnp.ndarray,
-#                             thetas: jnp.ndarray, log_probs: jnp.ndarray):
-#     """Single adjacent-swap sweep (even-odd could be added if desired).
-
-#     Returns updated (thetas, log_probs), plus boolean decisions per edge.
-#     """
-#     C = temperatures.shape[0]
-#     betas = 1.0 / temperatures
-#     # Δβ * ΔlogL between neighbors (using current log_probs ~ log target)
-#     dlog = (betas[1:] - betas[:-1]) * (log_probs[1:] - log_probs[:-1])
-
-#     key, ukey = random.split(key)
-#     u = jnp.log(random.uniform(ukey, shape=(C - 1,)))
-#     do_swap = dlog >= u
-
-#     def swap_edge(i, carry):
-#         th, lp = carry
-#         def yes():
-#             th1 = th.at[i].set(th[i + 1])
-#             th1 = th1.at[i + 1].set(th[i])
-#             lp1 = lp.at[i].set(lp[i + 1])
-#             lp1 = lp1.at[i + 1].set(lp[i])
-#             return th1, lp1
-#         return lax.cond(do_swap[i], yes, lambda: (th, lp))
-
-#     thetas2, logp2 = lax.fori_loop(0, C - 1, swap_edge, (thetas, log_probs))
-#     return key, thetas2, logp2, do_swap
-
-
-def _apply_swaps_vec(arr, i, j, accept):
-    """
-    arr: (C, ...) values to swap
-    i,j: (K,) pair indices
-    accept: (K,) booleans
-    """
-    ai, aj = arr[i], arr[j]
-    if arr.ndim == 1:
-        arr = arr.at[i].set(jnp.where(accept, aj, ai))
-        arr = arr.at[j].set(jnp.where(accept, ai, aj))
-    else:
-        arr = arr.at[i].set(jnp.where(accept[:, None], aj, ai))
-        arr = arr.at[j].set(jnp.where(accept[:, None], ai, aj))
-    return arr
-
-@jax.jit
-def parallel_tempering_swap(key, temperatures, thetas, log_probs, *, return_debug=False):
-    """
-    One PT swap sweep (even or odd, chosen at random).
-    temperatures: (C,)  *absolute T* (T0=1 is cold).  β = 1/T is computed inside.
-    thetas:       (C,D)
-    log_probs:    (C,)  untempered log π(θ) (includes prior!), not scaled by T.
-    returns: key, thetas_new, log_probs_new, swap_decisions (C-1,) bool [, debug dict]
-    """
-    C = thetas.shape[0]
-    beta = 1.0 / jnp.asarray(temperatures)
-    n_edges = C - 1
-
-    # Build even/odd adjacent index sets; pad odd to same static length
-    i_even = jnp.arange(0, n_edges, 2, dtype=jnp.int32)   # Ke = ceil(n_edges/2)
-    i_odd  = jnp.arange(1, n_edges, 2, dtype=jnp.int32)   # Ko = floor(n_edges/2)
-    Ke = i_even.shape[0]
-    Ko = i_odd.shape[0]
-    pad = Ke - Ko
-    i_odd_padded = jnp.concatenate([i_odd, -jnp.ones((pad,), dtype=jnp.int32)], axis=0)
-    valid_even = jnp.ones((Ke,), dtype=bool)
-    valid_odd  = jnp.arange(Ke) < Ko
-
-    # RNG: advance key and get subkeys
-    key, k_par = random.split(key)
-    key, k_u   = random.split(key)
-    parity = random.bernoulli(k_par)  # False->even, True->odd
-
-    def pick_even():
-        return i_even, valid_even
-    def pick_odd():
-        return i_odd_padded, valid_odd
-
-    i_raw, valid = lax.cond(parity, pick_odd, pick_even)  # both (Ke,)
-    # Safe indices for padded slots (map invalid to 0; we’ll mask later)
-    i = jnp.where(valid, i_raw, jnp.zeros_like(i_raw))
-    j = i + 1
-
-    # Correct MH exponent for swaps: Δ = (β_i - β_j) * (lp_j - lp_i)
-    delta = (beta[i] - beta[j]) * (log_probs[j] - log_probs[i])     # (Ke,)
-    delta = jnp.where(valid, delta, -jnp.inf)                        # mask padded
-    ulog  = jnp.log(random.uniform(k_u, shape=delta.shape))
-    accept_sel = ulog < delta                                        # (Ke,)
-
-    # Apply swaps simultaneously on the selected (non-overlapping) pairs
-    thetas_new = _apply_swaps_vec(thetas,    i, j, accept_sel)
-    logp_new   = _apply_swaps_vec(log_probs, i, j, accept_sel)
-
-    # Raster of decisions over all edges (C-1,)
-    raster = jnp.zeros((n_edges,), dtype=bool).at[i].set(jnp.where(valid, accept_sel, False))
-
-    if return_debug:
-        dbg = {"delta": delta, "ulog": ulog, "pairs_i": i, "pairs_j": j, "accept_sel": accept_sel, "parity": parity}
-        return key, thetas_new, logp_new, raster, dbg
-    return key, thetas_new, logp_new, raster
 
 
 # ------------------------- Adaptive driver (m epochs) -------------------------
@@ -875,10 +775,6 @@ def update_z_with_rejuv(key, X, z,
     lp_new = jnp.where(z_new.astype(bool), lp3 + lp1, lp2 + lp0)
     return X, z_new, lp_new, p1
 
-# helper from your swap impl
-def _apply_swaps_vec(arr, i, j, accept):
-    ai, aj = arr[i], arr[j]
-    return arr.at[i].set(jnp.where(accept, aj, ai)).at[j].set(jnp.where(accept, ai, aj))
 
 def run_epoch_device_fast_M23(
     key, init_state,                            # PTState must include .z (C,) int32
