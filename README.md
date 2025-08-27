@@ -45,7 +45,7 @@ Then run parallel tempering with the trained surrogate (see notebooks for
 complete examples):
 
 ```python
-from src.PTDAMH import temperature_ladder, run_adaptive_pt_device_fast
+from ptdamh.runner import temperature_ladder, run_adaptive_pt_device_fast
 
 # Define your log-probability function and initial state here
 T = temperature_ladder(n_temps=16, T_max=100.0)

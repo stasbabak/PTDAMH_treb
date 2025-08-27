@@ -12,15 +12,15 @@ Key features
   parallel-tempering swaps are attempted.
 - Each chain uses a 3-component proposal mixture: (full-cov RW, eigen-line RW,
   and pCN/independence-like move). Components and their log q are provided by
-  your existing `Proposals.build_general_mixture_components_per_chain`.
+  your existing `proposals.build_general_mixture_components_per_chain`.
 - After each epoch, per-chain covariance is adapted from a rolling buffer or
   from all seen post-swap states, with shrinkage + jitter for numerical safety.
 - We record for every step: proposed points, their log-likelihood, the chosen
   component index, acceptance mask, and swap decisions.
 
-This module expects your `Proposals.py` next to it. It does **not** modify
-`Proposals.py`. If you want to plug in different proposals, change only the
-`build_proposals(...)` function.
+This module expects the proposal helpers in :mod:`ptdamh.proposals`. It does
+**not** modify those helpers. If you want to plug in different proposals,
+change only the `build_proposals(...)` function.
 """
 from __future__ import annotations
 
@@ -34,7 +34,14 @@ import numpy as np
 from jax.scipy.linalg import solve_triangular
 from tqdm import trange, tqdm
 
-import Proposals  # your file with proposal factories  # noqa: F401
+from .proposals import (
+    _build_epoch_components,
+    _propose_fullcov,
+    _propose_eigenline,
+    _propose_student_t,
+    _propose_pcn,
+    _pcn_logq_delta,
+)
 
 
 # ------------------------- Utilities -------------------------
@@ -418,127 +425,6 @@ def _fold_params(x: jnp.ndarray, fold_mask: jnp.ndarray | None, period: float) -
     return x * (1.0 - m) + x_mod * m
 
 # Build proposal components per chain.
-def _build_epoch_components(
-    covs: jnp.ndarray,       # (C, D, D)
-    scale_small: jnp.ndarray,# (C,)
-    scale_line: jnp.ndarray, # (C,)
-    scale_big: jnp.ndarray,  # (C,)
-    jitter: float = 1e-9,
-):
-    # symmetrize + jitter
-    C, D, _ = covs.shape
-    I = jnp.eye(D)[None, :, :]
-    sym = 0.5 * (covs + jnp.swapaxes(covs, -1, -2)) + jitter * I
-
-    # per-chain Cholesky (batched)
-    L_chol = jnp.linalg.cholesky(sym)                     # (C, D, D), lower
-
-    # per-chain eigen (batched) for eigen-line
-    S, U = jnp.linalg.eigh(sym)                           # (C, D), (C, D, D)
-    S = jnp.clip(S, 1e-12, None)
-    axis_logits = jnp.log(jnp.sqrt(S) + 1e-12)            # (C, D)
-
-    fullcov = {
-        "L_chol": L_chol,
-        "scale_small": scale_small,
-        "scale_big":   scale_big,
-    }
-    eigenline = {
-        "U": U, "S": S, "axis_logits": axis_logits, "scale": scale_line
-    }
-    return fullcov, eigenline
-
-def _propose_fullcov(key, x, L, scale):
-    # x: (C,D), L: (C,D,D), scale: (C,)
-    C, D = x.shape
-    cd_const = 2.38 / jnp.sqrt(D) * 0.5  # empirical scale factor
-    z = random.normal(key, x.shape)
-    step = jnp.einsum('cij,cj->ci', L, z)        # (C, D)
-    # return x + scale[:, None] * step
-    return x + cd_const * step
-
-def _propose_eigenline(key_axis, key_noise, x, U, S,  scale, axis_logits=None):
-    """
-    Propose a step along a single, randomly chosen eigenvector for each chain.
-    The eigenvector can be chosen uniformly or weighted by logits.
-    """
-    C, D = x.shape
-    if axis_logits is None:
-        # Uniformly choose an axis for each chain if no logits are provided
-        axes = random.randint(key_axis, shape=(C,), minval=0, maxval=D)
-    else:
-        # Choose axis based on provided logits (e.g., proportional to sqrt(eigenvalue))
-        axes = vmap(lambda lg, k: random.categorical(k, lg))(axis_logits, random.split(key_axis, C))  # (C,)
-
-    Usel = jnp.take_along_axis(U, axes[:, None, None], axis=2).squeeze(-1)   # (C, D)
-    Ssel = jnp.take_along_axis(S, axes[:, None], axis=1).squeeze(-1)         # (C,)
-    r = random.normal(key_noise, (C,))
-    # step = (scale * jnp.sqrt(Ssel) * r)[:, None] * Usel
-    step = (jnp.sqrt(Ssel) * r)[:, None] * Usel
-    return x + step
-
-def _propose_student_t(key_norm, key_gamma, x, L, scale, nu=5.0):
-    """
-    x:     (C, D)
-    L:     (C, D, D)   Cholesky of per-chain covariance
-    nu:    (C,) or scalar  degrees of freedom
-    scale: (C,)         step scale per chain
-    returns: (C, D)
-    """
-    C, D = x.shape
-    cd_const = 2.38 / jnp.sqrt(D) * 0.5  # empirical scale factor
-    z = random.normal(key_norm, (C, D))                               # N(0, I)
-    g = random.gamma(key_gamma, a=(nu if jnp.ndim(nu)==0 else nu[:,None]) / 2.0,
-                     shape=(C, 1)) * (2.0 / (nu if jnp.ndim(nu)==0 else nu[:,None]))
-    t = z / jnp.sqrt(g)                                               # iid t_nu
-    # step = cd_const * (scale[:, None]) * jnp.einsum('cij,cj->ci', L, t)
-    step = cd_const * jnp.einsum('cij,cj->ci', L, t)
-    return x + step
-
-def _propose_pcn(key, x, mu, L, scale, beta=0.3):
-    """
-    x, mu:   (C, D)
-    L:       (C, D, D)   Cholesky of cov
-    beta:    (C,) or scalar
-    scale:   (C,)            runtime tuning (multiplies beta)
-    returns: (C, D)
-    """
-    # b = beta * scale
-    C, D = x.shape
-    b = (beta if jnp.ndim(beta)==0 else beta) * (scale if jnp.ndim(scale)==0 else scale)  # per-chain scale
-    alpha = jnp.sqrt(1.0 - b**2)
-
-    # Generate correlated noise N(0, Σ) for each chain
-    # z ~ N(0, I), eps = L @ z
-    eps = jnp.einsum('cij,cj->ci', L, random.normal(key, x.shape))
-
-    # pCN update: x_new = mu + alpha*(x - mu) + b*eps
-    # The implementation is an equivalent rearrangement:
-    # x_new = alpha*x + b*eps + (1-alpha)*mu
-    return alpha[:, None] * x + b[:, None] * eps + (1.0 - alpha)[:, None] * mu
-
-def _pcn_logq_delta(x, y, mu, L, scale, beta=0.3):
-    """
-    Δlogq = log q(x|y) - log q(y|x)  for pCN with cov = (b^2) Σ, mean = a·state + (1-a)·mu.
-    x,y,mu: (C,D); L: (C,D,D); beta,scale: (C,) or scalars
-    returns: (C,)
-    """
-    b = (beta if jnp.ndim(beta)==0 else beta) * (scale if jnp.ndim(scale)==0 else scale)  # (C,)
-    b2 = jnp.clip(b*b, 1e-12, 1.0 - 1e-12)
-    a  = jnp.sqrt(1.0 - b2)    # (C,)                                                               
-
-    m_x = a[:, None]*x + (1.0 - a)[:, None]*mu
-    m_y = a[:, None]*y + (1.0 - a)[:, None]*mu
-
-    # whitened residuals via triangular solve per chain
-    def maha_sq(Lc, v):
-        w = solve_triangular(Lc, v, lower=True)
-        return jnp.sum(w*w)
-
-    maha_y_given_x = vmap(maha_sq)(L, (y - m_x))   # (C,)
-    maha_x_given_y = vmap(maha_sq)(L, (x - m_y))   # (C,)
-
-    return -0.5 * (maha_x_given_y - maha_y_given_x) / (b*b + 1e-32)
 
 ################################################################################
 # --- core epoch ---
