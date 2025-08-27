@@ -1,5 +1,4 @@
-### Training NN to predict log-likelihood
-
+"""Train a neural network to approximate log-likelihood."""
 import numpy as np
 from typing import Sequence
 import jax, jax.numpy as jnp
@@ -9,6 +8,7 @@ from flax.training import train_state
 from functools import partial
 from tqdm.auto import tqdm
 import pickle
+
 
 def build_features(
     X, y, *,
@@ -34,8 +34,6 @@ def build_features(
         parts.append((1.0/np.maximum(T, 1e-12))[:, None])
 
     X_feat = np.concatenate(parts, axis=1).astype(np.float32)
-    # print ('debug, ', X_feat.shape)
-    # print ('debug, mean:', X_feat.mean(0))
 
     x_mean, x_std = X_feat.mean(0), X_feat.std(0) + 1e-8
     Xn = (X_feat - x_mean) / x_std
@@ -50,40 +48,6 @@ def build_features(
     )
     return Xn, yn, meta
 
-
-
-# class ResBlock(nn.Module):
-#     width: int
-#     dropout: float = 0.0
-#     @nn.compact
-#     def __call__(self, x, train: bool):
-#         h = nn.Dense(self.width)(x)  # Moved here
-#         h = nn.LayerNorm()(h)
-#         h = nn.gelu(h)
-#         if self.dropout > 0:
-#             h = nn.Dropout(self.dropout)(h, deterministic=not train)
-#         h = nn.Dense(self.width)(h)
-#         return x + h
-
-# class LogProbNet(nn.Module):
-#     widths: Sequence[int] = (512, 512)
-#     blocks_per_layer: int = 1
-#     dropout: float = 0.1
-#     heteroscedastic: bool = False
-
-#     @nn.compact
-#     def __call__(self, x, train: bool = True):
-#         x = nn.LayerNorm()(x)
-#         h = nn.Dense(self.widths[0])(x)
-#         for w in self.widths:
-#             for _ in range(self.blocks_per_layer):
-#                 h = ResBlock(w, dropout=self.dropout)(h, train=train)
-#         if self.heteroscedastic:
-#             out = nn.Dense(2)(h)
-#             mu, log_var = out[...,0], nn.softplus(out[...,1]) + 1e-6
-#             return mu, log_var
-#         else:
-#             return nn.Dense(1)(h).squeeze(-1)
 
 class ResBlock(nn.Module):
     width: int
@@ -125,10 +89,6 @@ class LogProbNet(nn.Module):
         else:
             return nn.Dense(1)(h).squeeze(-1)
         
-# alternative is widths=(768, 768, 768, 768, 768), dropout=0.1
-
-
-
 
 ### Data loader
 
@@ -161,38 +121,6 @@ def data_loader(X, y, batch_size, shuffle=True, seed=0):
 class TrainState(train_state.TrainState):
     pass
 
-
-# @partial(jax.jit, static_argnames=("heteroscedastic",))
-# def _grad_step(params, apply_fn, x, y, heteroscedastic):
-#     def loss_fn(p):
-#         out = apply_fn({'params': p}, x, train=True)
-#         if heteroscedastic:
-#             mu, logv = out
-#             return jnp.mean(0.5 * ((y - mu)**2 * jnp.exp(-logv) + logv))
-#         else:
-#             pred = out
-#             return jnp.mean((y - pred)**2)
-#     return jax.grad(loss_fn)(params)
-
-
-# @jax.jit
-# def _apply_updates(params, opt_state, tx, grads):
-#     updates, opt_state = tx.update(grads, opt_state, params)
-#     return optax.apply_updates(params, updates), opt_state
-
-
-
-# def make_optimizer(lr, weight_decay, steps, clip_norm=1.0):
-#     sched = optax.warmup_cosine_decay_schedule(
-#         init_value=0.0, peak_value=lr,
-#         warmup_steps=int(0.05*steps),
-#         decay_steps=steps, end_value=0.05*lr
-#     )
-#     tx = optax.chain(
-#         optax.clip_by_global_norm(clip_norm),
-#         optax.adamw(sched, weight_decay=weight_decay),
-#     )
-#     return tx
 
 def make_optimizer(total_steps, *, peak_lr=3e-4, end_lr=1e-5,
                    warmup_frac=0.05, weight_decay=1e-4, clip_norm=1.0):
@@ -334,7 +262,6 @@ def train_with_accum(
                 yb = jnp.asarray(big_y[i:i+microbatch])
                 wb = jnp.asarray(big_w[i:i+microbatch])
                 g = _grad_step(params, xb, yb, wb, heteroscedastic, mb_key)
-                # g = _grad_step(params, xb, yb, heteroscedastic)
                 grad_sum = g if grad_sum is None else jax.tree_util.tree_map(lambda a, b: a + b, grad_sum, g)
                 count += 1
             grads = jax.tree_util.tree_map(lambda g: g / count, grad_sum)
@@ -506,76 +433,5 @@ def load_surrogate(pkl_path):
 
     return predict, meta, params
 
-
-
-
-### after training
-
-# def make_surrogate_logprob_fn(model, params, meta, Xn_train=None):
-#     mu_f, inv_cov = None, None
-#     if Xn_train is not None and len(Xn_train) > 1000:
-#         mu_f = Xn_train.mean(0)
-#         cov  = np.cov(Xn_train, rowvar=False) + 1e-3*np.eye(Xn_train.shape[1])
-#         inv_cov = np.linalg.inv(cov)
-
-#     def _featurize(theta, T=None):
-#         theta = np.asarray(theta)[None, :]
-#         D = meta["D_raw"]; mask = np.ones(D, bool); mask[meta["periodic_idx"]] = False
-#         X_lin = theta[:, mask]
-#         parts = [X_lin]
-#         if meta["periodic_idx"].size:
-#             thp = theta[:, meta["periodic_idx"]]
-#             parts += [np.sin(2*np.pi*thp/meta["period"]), np.cos(2*np.pi*thp/meta["period"])]
-#         if meta.get("add_invT", False) and T is not None:
-#             parts.append(np.array([[1.0/max(T, 1e-12)]]))
-#         x = np.concatenate(parts, axis=1)
-#         x = (x - meta["x_mean"]) / meta["x_std"]
-#         return x.astype(np.float32)
-
-#     @jax.jit
-#     def _apply(x_batched):
-#         return model.apply({'params': params}, x_batched, train=False)
-
-#     def logprob(theta, T=None, return_ood=False):
-#         x = _featurize(theta, T)
-#         pred = _apply(jnp.asarray(x))
-#         if isinstance(pred, tuple):  # heteroscedastic
-#             pred = pred[0]
-#         y_norm = np.array(pred)[0]
-#         y = y_norm * meta["y_std"] + meta["y_mean"]
-#         if return_ood and mu_f is not None:
-#             d = x - mu_f
-#             ood = float(d @ inv_cov @ d.T)  # Mahalanobis in feature space
-#             return y, ood
-#         return y
-
-#     return logprob
-
-# # 1) Get dataset from your sampler
-# ds = run_info["dataset"]
-# X_raw = ds["X"]                # (N, 24)
-# y     = ds["y_logprob"]        # (N,)
-# T     = ds["temperature"]      # (N,) if you ever need it
-
-# # 2) Build features
-# Xn, yn, meta = build_features(
-#     X_raw, y, periodic_idx=fold_idx, period=1.0, add_invT=False, T=None
-# )
-
-# # 3) Train (Base)
-# model, state, summ = train_logprob_net(
-#     Xn, yn,
-#     heteroscedastic=False,
-#     widths=(512,512,512,512), blocks=2, dropout=0.0,
-#     batch=4096, epochs=250, lr=3e-4, weight_decay=1e-4,
-#     val_frac=0.1, val_block=True, seed=0
-# )
-# print("best normed val RMSE:", summ["val_rmse_norm"])
-
-# # 4) Surrogate fn
-# surrogate = make_surrogate_logprob_fn(model, state.params, meta, Xn_train=Xn)
-
-# # 5) Use inside PT-(D)AMH stage-1 with OOD fallback if you like
-# lp_pred, ood = surrogate(theta, return_ood=True)
 
 

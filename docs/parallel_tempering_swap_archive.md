@@ -117,3 +117,31 @@ def parallel_tempering_swap(key, temperatures, thetas, log_probs, *, return_debu
         return key, thetas_new, logp_new, raster, dbg
     return key, thetas_new, logp_new, raster
 ```
+
+## Archived adaptive drivers
+
+Early versions of the adaptive parallel tempering drivers were previously
+embedded in the source tree.  Their signatures are preserved here for
+historical reference.
+
+### `run_adaptive_pt_device_fast`
+
+```python
+def run_adaptive_pt_device_fast(key, initial_thetas, temperatures,
+                                log_prob_fn_single, base_cov, *,
+                                fold_idx=(), period=1.0, weights=None,
+                                cfg=AdaptConfig(), lik_chunk=32,
+                                big_scale_factor=3.0):
+    ...
+```
+
+### `run_adaptive_3pro_mix_ptmcmc`
+
+```python
+def run_adaptive_3pro_mix_ptmcmc(key, initial_thetas, temperatures,
+                                 true_logprob_fn, base_cov, ...):
+    ...
+```
+
+These implementations have been superseded by the current device-first
+runner but are kept here for context.
