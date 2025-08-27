@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ptdamh"
+version = "0.1.0"
+description = "Parallel Tempering Delayed Acceptance MCMC with neural network surrogate models"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [{name = "PTDAMH Developers"}]
+dependencies = [
+    "jax",
+    "jaxlib",
+    "numpy",
+    "flax",
+    "optax",
+    "tqdm",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

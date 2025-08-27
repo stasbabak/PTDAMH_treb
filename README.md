@@ -27,10 +27,10 @@ for efficient numerical computation. A typical environment requires:
 
 2. Create and activate a virtual environment (optional but recommended).
 
-3. Install dependencies:
+3. Install the package and its dependencies:
 
    ```bash
-   pip install jax jaxlib numpy flax optax tqdm
+   pip install .
    ```
 
 ## Example usage
