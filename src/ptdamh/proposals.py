@@ -458,3 +458,43 @@ def _pcn_logq_delta(x, y, mu, L, scale, beta=0.3):
 
 
 
+# ----- NEW: Goodman–Weare stretch move for an ensemble of walkers -----
+def _propose_stretch_ensemble(
+    key_partner,       # PRNGKey for partner choice
+    key_scale,         # PRNGKey for z ~ g(z) ∝ 1/sqrt(z)
+    X,                 # (C, W, D) current states
+    a: float = 2.0,    # stretch parameter (typical 1.5–3.0)
+):
+    """
+    Propose X' = Y + z * (X - Y) for each walker, where Y is a random partner
+    from the same temperature group, and z ∈ [1/a, a] with density g(z) ∝ 1/√z.
+
+    Returns:
+      X_prop: (C, W, D)
+      log_J:  (C, W)  with (D-1)*log(z) per walker (Jacobian term)
+      z:      (C, W)  proposed stretch factors (useful for debugging)
+    """
+    C, W, D = X.shape
+
+    # 1) choose a partner index per (c,w), excluding self
+    # sample k ∈ {0..W-2}, then map to partner idx: k + (k >= w)
+    k = jax.random.randint(key_partner, shape=(C, W), minval=0, maxval=max(W - 1, 1))
+    idx = jnp.arange(W)
+    idx = jnp.broadcast_to(idx, (C, W))  # per temp row we’ll compare with w
+    partner = k + (k >= idx)
+
+    # gather partners Y = X[c, partner[c,w], :]
+    arange_c = jnp.arange(C)[:, None]
+    Y = X[arange_c, partner, :]  # (C, W, D)
+
+    # 2) sample z with CDF F(z) = (√z - 1/√a) / (√a - 1/√a), z ∈ [1/a, a]
+    u = jax.random.uniform(key_scale, shape=(C, W))
+    sa = jnp.sqrt(a)
+    z = (u * (sa - 1.0 / sa) + 1.0 / sa) ** 2
+
+    # 3) propose
+    X_prop = Y + z[..., None] * (X - Y)
+
+    # 4) Jacobian term for full-D stretch
+    log_J = (D - 1) * jnp.log(z)
+    return X_prop, log_J, z
