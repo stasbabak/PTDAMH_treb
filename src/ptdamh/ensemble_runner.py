@@ -743,6 +743,7 @@ def run_adaptive_pt_device_fast(
     swap_rate_epoch  = []         # scalar (mean over walkers & edges)
     accept_rate_epoch= []         # (C) mean over walkers
 
+    num_of_proposals = 5
     # ---------- main loop ----------
     for epoch in trange(cfg.m_epochs, desc="Adaptive PT (ensemble)", unit="epoch"):
         covs_j = jnp.asarray(covs)  # (C,D,D)
@@ -752,7 +753,7 @@ def run_adaptive_pt_device_fast(
         # sample with numpy on host (fast, simple)
         for c in range(C):
             for w in range(W):
-                comp_idx[c, w] = np.random.choice(5, p=Wts[c, w])
+                comp_idx[c, w] = np.random.choice(num_of_proposals, p=Wts[c, w])
         comp_idx_j = jnp.asarray(comp_idx)  # (C,W)
 
         key, subkey = random.split(key)
