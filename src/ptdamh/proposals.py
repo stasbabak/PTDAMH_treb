@@ -395,106 +395,418 @@ def _build_epoch_components(
     return fullcov, eigenline
 
 
+def _as_ensemble(x):
+    """Ensure x has shape (C, W, D)."""
+    if x.ndim == 2:  # (C, D) -> (C, 1, D)
+        x = x[:, None, :]
+        squeeze = True
+    elif x.ndim == 3:
+        squeeze = False
+    else:
+        raise ValueError(f"x must be (C,D) or (C,W,D); got {x.shape}")
+    C, W, D = x.shape
+    return x, C, W, D, squeeze
+
 def _propose_fullcov(key, x, L, scale):
-    """Full-covariance Gaussian random walk proposal."""
-    C, D = x.shape
+    """Full-covariance Gaussian random walk proposal.
+        Accepts x of shape (C,D) or (C,W,D). Returns same rank as x.
+    """
+    x, C, W, D, squeeze = _as_ensemble(x)
+    z = random.normal(key, (C, W, D))
+    # transform noise per chain via Cholesky
+    eps = jnp.einsum("cij,cwj->cwi", L, z)  # (C,W,D)
+    # scaling
+    # scale_c = jnp.asarray(scale)            # () or (C,)
+    # if scale_c.ndim == 0:
+    #     scale_c = jnp.full((C,), scale_c)
+    # 2.38/sqrt(D) factor (classic)
     cd_const = 2.38 / jnp.sqrt(D) * 0.5
-    z = random.normal(key, x.shape)
-    step = jnp.einsum("cij,cj->ci", L, z)
-    return x + cd_const * step
+    # step = cd_const * scale_c[:, None, None] * eps
+    step = cd_const * eps
+    out = x + step
+    return out[:, 0, :] if squeeze else out
 
 
 def _propose_eigenline(key_axis, key_noise, x, U, S, scale, axis_logits=None):
     """Propose along a single eigen-direction for each chain."""
-    C, D = x.shape
-    if axis_logits is None:
-        axes = random.randint(key_axis, shape=(C,), minval=0, maxval=D)
-    else:
-        axes = vmap(lambda lg, k: random.categorical(k, lg))(axis_logits, random.split(key_axis, C))
+    x, C, W, D, squeeze = _as_ensemble(x)
 
-    Usel = jnp.take_along_axis(U, axes[:, None, None], axis=2).squeeze(-1)
-    Ssel = jnp.take_along_axis(S, axes[:, None], axis=1).squeeze(-1)
-    r = random.normal(key_noise, (C,))
-    step = (jnp.sqrt(Ssel) * r)[:, None] * Usel
-    return x + step
+    # choose axis per (C,W)
+    if axis_logits is None:
+        axes = random.randint(key_axis, (C, W), 0, D)  # (C,W)
+    else:
+        lg = jnp.asarray(axis_logits)
+        if lg.shape == (C, D):
+            # same categorical over axes for all walkers at chain c
+            ks = random.split(key_axis, C)
+            axes_c = vmap(lambda lg_c, k: random.categorical(k, lg_c))(lg, ks)  # (C,)
+            axes = jnp.repeat(axes_c[:, None], W, axis=1)                        # (C,W)
+        elif lg.shape == (C, W, D):
+            ks = random.split(key_axis, C * W).reshape(C, W, 2)  # 2 keys not needed; but shape ok
+            # Use one key per (c,w)
+            def cat_one(lg_cw, kpair):
+                # kpair[0] is fine
+                return random.categorical(kpair[0], lg_cw)
+            axes = jax.vmap(jax.vmap(cat_one, in_axes=(0,0)), in_axes=(0,0))(lg, ks)  # (C,W)
+        else:
+            raise ValueError(f"axis_logits must be (C,D) or (C,W,D); got {lg.shape}")
+
+    # scale_c = jnp.asarray(scale)
+    # if scale_c.ndim == 0:
+    #     scale_c = jnp.full((C,), scale_c)
+    
+    # gather eigenvectors/eigenvalues for chosen axis
+    # U[:, :, axis] -> (C,W,D)
+    U_ax = U[jnp.arange(C)[:, None], :, axes]            # (C,W,D)
+    S_ax = S[jnp.arange(C)[:, None], axes]               # (C,W)
+
+    r = random.normal(key_noise, (C, W))
+    # step_mag = (scale_c[:, None] * r * jnp.sqrt(S_ax))[..., None]  # (C,W,1)
+    step = ( r * jnp.sqrt(S_ax))[..., None]  # (C,W,1)
+    out = x + step * U_ax
+    return out[:, 0, :] if squeeze else out
 
 
 def _propose_student_t(key_norm, key_gamma, x, L, scale, nu=5.0):
     """Student-t random walk proposal."""
-    C, D = x.shape
+    x, C, W, D, squeeze = _as_ensemble(x)
+
+    z = random.normal(key_norm, (C, W, D))   # base normal
+    nu_c = jnp.asarray(nu)
+    if nu_c.ndim == 0:
+        nu_c = jnp.full((C,), nu_c)
+
+    # Gamma ~ χ²_ν as Gamma(ν/2, 1/2) -> here we use Gamma(ν/2) and rescale
+    g = random.gamma(key_gamma, a=nu_c[:, None] / 2.0, shape=(C, W))  # (C,W)
+    g = g * (2.0 / nu_c[:, None])                                     # (C,W)
+    t = z / jnp.sqrt(g[..., None])                                    # (C,W,D)
+
+    t_tr = jnp.einsum("cij,cwj->cwi", L, t)                           # (C,W,D)
+
+    # scale_c = jnp.asarray(scale)
+    # if scale_c.ndim == 0:
+    #     scale_c = jnp.full((C,), scale_c)
+
     cd_const = 2.38 / jnp.sqrt(D) * 0.5
-    z = random.normal(key_norm, (C, D))
-    g = random.gamma(key_gamma, a=(nu if jnp.ndim(nu) == 0 else nu[:, None]) / 2.0, shape=(C, 1))
-    g = g * (2.0 / (nu if jnp.ndim(nu) == 0 else nu[:, None]))
-    t = z / jnp.sqrt(g)
-    step = cd_const * jnp.einsum("cij,cj->ci", L, t)
-    return x + step
+    # step = cd_const * scale_c[:, None, None] * t_tr
+    step = cd_const  * t_tr
+    out = x + step
+    return out[:, 0, :] if squeeze else out
 
 
+# -------------------- pCN proposal --------------------
 def _propose_pcn(key, x, mu, L, scale, beta=0.3):
-    """Preconditioned Crank–Nicolson proposal."""
-    b = (beta if jnp.ndim(beta) == 0 else beta) * (scale if jnp.ndim(scale) == 0 else scale)
-    alpha = jnp.sqrt(1.0 - b**2)
-    eps = jnp.einsum("cij,cj->ci", L, random.normal(key, x.shape))
-    return alpha[:, None] * x + b[:, None] * eps + (1.0 - alpha)[:, None] * mu
+    """
+    Preconditioned Crank–Nicolson proposal for ensemble.
+    mu: (C,D); L: (C,D,D); scale: () or (C,); beta: () or (C,)
+    """
+    x, C, W, D, squeeze = _as_ensemble(x)
 
+    beta_c  = jnp.asarray(beta)
+    scale_c = jnp.asarray(scale)
+    if beta_c.ndim == 0:
+        beta_c = jnp.full((C,), beta_c)
+    if scale_c.ndim == 0:
+        scale_c = jnp.full((C,), scale_c)
+    b = beta_c * scale_c                       # (C,)
+    b = jnp.clip(b, 1e-8, 1.0 - 1e-8)
+    a = jnp.sqrt(1.0 - b * b)                  # (C,)
 
+    eps = random.normal(key, (C, W, D))
+    eps = jnp.einsum("cij,cwj->cwi", L, eps)   # (C,W,D)
+
+    mu_c = jnp.asarray(mu)                     # (C,D)
+    out = a[:, None, None] * x + b[:, None, None] * eps + (1.0 - a)[:, None, None] * mu_c[:, None, :]
+    return out[:, 0, :] if squeeze else out
+
+# -------------------- pCN Δlog q(y|x) - Δlog q(x|y) --------------------
 def _pcn_logq_delta(x, y, mu, L, scale, beta=0.3):
-    """Difference in log proposal densities for pCN proposals."""
-    b = (beta if jnp.ndim(beta) == 0 else beta) * (scale if jnp.ndim(scale) == 0 else scale)
-    b2 = jnp.clip(b * b, 1e-12, 1.0 - 1e-12)
-    a = jnp.sqrt(1.0 - b2)
+    """
+    Difference in log proposal densities for pCN proposals:
+      Δ = log q(y|x) - log q(x|y)
+    Works for x,y with shape (C,D) or (C,W,D). Returns (C,) or (C,W) respectively.
+    """
+    # upgrade to ensemble
+    x, C, W, D, squeeze = _as_ensemble(x)
+    y, C2, W2, D2, _ = _as_ensemble(y)
+    assert (C2, W2, D2) == (C, W, D)
 
-    m_x = a[:, None] * x + (1.0 - a)[:, None] * mu
-    m_y = a[:, None] * y + (1.0 - a)[:, None] * mu
+    beta_c  = jnp.asarray(beta)
+    scale_c = jnp.asarray(scale)
+    if beta_c.ndim == 0:
+        beta_c = jnp.full((C,), beta_c)
+    if scale_c.ndim == 0:
+        scale_c = jnp.full((C,), scale_c)
+    b  = jnp.clip(beta_c * scale_c, 1e-8, 1.0 - 1e-8)   # (C,)
+    b2 = b * b
+    a  = jnp.sqrt(1.0 - b2)                             # (C,)
 
-    def maha_sq(Lc, v):
-        w = solve_triangular(Lc, v, lower=True)
-        return jnp.sum(w * w)
+    mu_c = jnp.asarray(mu)  # (C,D)
+    m_x = a[:, None, None] * x + (1.0 - a)[:, None, None] * mu_c[:, None, :]
+    m_y = a[:, None, None] * y + (1.0 - a)[:, None, None] * mu_c[:, None, :]
 
-    maha_y_given_x = vmap(maha_sq)(L, (y - m_x))
-    maha_x_given_y = vmap(maha_sq)(L, (x - m_y))
-    return -0.5 * (maha_x_given_y - maha_y_given_x) / (b * b + 1e-32)
+    # Mahalanobis squared using L (C,D,D), for each chain over all walkers
+    # We compute ||L^{-1} v||^2 where v has shape (W,D) per chain.
+    def maha_sq_chain(Lc, Vw):  # Lc: (D,D), Vw: (W,D) -> (W,)
+        # solve for each walker as RHS; solve_triangular supports batched RHS via trailing dims
+        Wloc = solve_triangular(Lc, Vw.T, lower=True)  # (D,W)
+        return jnp.sum(Wloc * Wloc, axis=0)            # (W,)
+
+    maha_y_given_x = jax.vmap(maha_sq_chain, in_axes=(0, 0))(L, (y - m_x))  # (C,W)
+    maha_x_given_y = jax.vmap(maha_sq_chain, in_axes=(0, 0))(L, (x - m_y))  # (C,W)
+
+    delta = -0.5 * (maha_x_given_y - maha_y_given_x) / (b2[:, None] + 1e-32)  # (C,W)
+    return delta[:, 0] if squeeze else delta
 
 
 
 # ----- NEW: Goodman–Weare stretch move for an ensemble of walkers -----
 def _propose_stretch_ensemble(
-    key_partner,       # PRNGKey for partner choice
-    key_scale,         # PRNGKey for z ~ g(z) ∝ 1/sqrt(z)
-    X,                 # (C, W, D) current states
-    a: float = 2.0,    # stretch parameter (typical 1.5–3.0)
+    key_partner,
+    key_scale,
+    X,            # (C, W, D)
+    a: float = 2.0,
 ):
-    """
-    Propose X' = Y + z * (X - Y) for each walker, where Y is a random partner
-    from the same temperature group, and z ∈ [1/a, a] with density g(z) ∝ 1/√z.
-
-    Returns:
-      X_prop: (C, W, D)
-      log_J:  (C, W)  with (D-1)*log(z) per walker (Jacobian term)
-      z:      (C, W)  proposed stretch factors (useful for debugging)
-    """
     C, W, D = X.shape
+    arange_C = jnp.arange(C)[:, None]
+    arange_W = jnp.arange(W)[None, :]
 
-    # 1) choose a partner index per (c,w), excluding self
-    # sample k ∈ {0..W-2}, then map to partner idx: k + (k >= w)
-    k = jax.random.randint(key_partner, shape=(C, W), minval=0, maxval=max(W - 1, 1))
-    idx = jnp.arange(W)
-    idx = jnp.broadcast_to(idx, (C, W))  # per temp row we’ll compare with w
-    partner = k + (k >= idx)
+    # --- self-avoiding partners: partner = (w + off) % W, off ∈ {1..W-1}
+    # Works also for W=1 (we’ll just fall back to identity below).
+    off = jax.random.randint(key_partner, shape=(C, W), minval=1, maxval=jnp.maximum(W, 2))
+    partner = (arange_W + off) % jnp.maximum(W, 1)
 
-    # gather partners Y = X[c, partner[c,w], :]
-    arange_c = jnp.arange(C)[:, None]
-    Y = X[arange_c, partner, :]  # (C, W, D)
+    Y = X[arange_C, partner, :]  # (C, W, D)
 
-    # 2) sample z with CDF F(z) = (√z - 1/√a) / (√a - 1/√a), z ∈ [1/a, a]
+    # --- draw z with g(z) ∝ 1/sqrt(z) on [1/a, a]
     u = jax.random.uniform(key_scale, shape=(C, W))
     sa = jnp.sqrt(a)
-    z = (u * (sa - 1.0 / sa) + 1.0 / sa) ** 2
+    z = (u * (sa - 1.0 / sa) + 1.0 / sa) ** 2  # (C, W)
 
-    # 3) propose
-    X_prop = Y + z[..., None] * (X - Y)
+    # If W==1, partner==self; make the move a no-op (keeps code safe).
+    same = (W == 1)
+    X_prop = jnp.where(same, X, Y + z[..., None] * (X - Y))
 
-    # 4) Jacobian term for full-D stretch
-    log_J = (D - 1) * jnp.log(z)
+    log_J = (D - 1) * jnp.log(jnp.where(same, jnp.ones_like(z), z))
     return X_prop, log_J, z
+
+
+def _propose_stretch(
+    key_partner,
+    key_scale,
+    X,                       # (C, W, D)
+    a: float = 2.0,
+    z: jnp.ndarray | None = None,   # (C, W) or None
+):
+    """
+    Goodman–Weare stretch proposal for an ensemble (per temperature c, across walkers w).
+
+    If `z` is provided (shape (C, W)), each (c, w) only chooses a partner among walkers
+    at the same temperature `c` that share the same label z[c,w]. If no such partner
+    exists, the move for that (c,w) is a no-op with log-Jacobian 0.
+
+    If `z` is None, partners are chosen uniformly among all NON-SELF walkers in (c, ·).
+    For W == 1 the move is a no-op with log-Jacobian 0.
+
+    Returns:
+      X_prop:        (C, W, D)
+      logJ:          (C, W)
+      partner_idx:   (C, W)   indices of chosen partners (self if no eligible partner)
+      has_partner:   (C, W)   bool mask, True if a non-self eligible partner existed
+      z_factor:      (C, W)   the sampled stretch factor on [1/a, a] (useful for debug)
+    """
+    C, W, D = X.shape
+    arW = jnp.arange(W)
+
+    # --- build eligibility mask (C, W, W) ---
+    # not-self mask shared by both modes
+    not_self = (arW[None, :, None] != arW[None, None, :])  # (1, W, W) -> broadcast
+    if z is None:
+        # unrestricted: any non-self partner eligible
+        elig = jnp.broadcast_to(not_self, (C, W, W))        # (C, W, W)
+    else:
+        # restricted: same z AND not self
+        same_z = (z[:, :, None] == z[:, None, :])           # (C, W, W)
+        elig   = same_z & not_self                          # (C, W, W)
+
+    has_partner = elig.any(axis=-1)                         # (C, W)
+
+    # --- sample partner via masked Gumbel-max (stable inside jit) ---
+    logits  = jnp.where(elig, 0.0, -1e9)                    # (C, W, W)
+    g       = jax.random.gumbel(key_partner, logits.shape)
+    partner = jnp.argmax(logits + g, axis=-1)               # (C, W)
+    # fallback to self where no eligible partner
+    partner = jnp.where(has_partner, partner, arW[None, :]) # (C, W)
+
+    # gather partners' positions
+    Y = X[jnp.arange(C)[:, None], partner, :]               # (C, W, D)
+
+    # --- draw stretch factor zfac ~ g(z) ∝ 1/sqrt(z) on [1/a, a] ---
+    u   = jax.random.uniform(key_scale, (C, W))
+    sa  = jnp.sqrt(a)
+    zfac = (u * (sa - 1.0 / sa) + 1.0 / sa) ** 2            # (C, W)
+
+    # propose; no-op where no partner or W==1
+    sameW = (W == 1)
+    do_move = has_partner & (~sameW)                        # (C, W)
+    X_prop  = jnp.where(do_move[..., None], Y + zfac[..., None] * (X - Y), X)
+    logJ    = jnp.where(do_move, (D - 1) * jnp.log(zfac), 0.0)
+
+    return X_prop, logJ, partner, has_partner, zfac
+
+
+
+def _propose_de_two_point(
+    key_partner,
+    key_gamma,
+    X,                             # (C, W, D)
+    z: jnp.ndarray | None = None,  # (C, W) or None  (restrict partners to same label if provided)
+    *,
+    same_z_required: bool = True,  # True => only same-z partners (if z provided)
+    gamma: float | None = None,    # fixed |γ|; if None, draw symmetric Normal(0, σ^2)
+    gamma_scale: float = 2.38,     # σ = gamma_scale / sqrt(2D) when gamma is None (classic DE)
+    crossover_rate: float = 0.8,   # per-dimension prob to update (DE "CR"); set 1.0 for full update
+    jitter_scale: float = 0.0,     # ε ~ N(0, jitter_scale^2 I) (small)
+):
+    """
+    Differential-Evolution (two-point) proposal for each (c,w):
+        x' = x + γ * (y - z) + ε
+    Partners y and z are sampled among walkers at the same temperature.
+    If z is provided and same_z_required=True, restrict to same z[c,w].
+    Safe when fewer than 2 partners exist: returns a no-op for that (c,w).
+
+    Returns:
+      X_prop     : (C, W, D)
+      idx_y      : (C, W)  chosen partner indices for y   (self if no pair)
+      idx_z      : (C, W)  chosen partner indices for z   (self if no pair)
+      has_pair   : (C, W)  bool, True if ≥2 eligible partners existed
+      mask_used  : (C, W, D) bool crossover mask actually applied
+    """
+    C, W, D = X.shape
+    arW = jnp.arange(W)
+
+    # ---------- eligibility (C,W,W): non-self, and optionally same-z ----------
+    not_self = (arW[None, :, None] != arW[None, None, :])  # (1,W,W) -> broadcast
+    if (z is not None) and same_z_required:
+        same_lbl = (z[:, :, None] == z[:, None, :])        # (C,W,W)
+        elig = same_lbl & not_self
+    else:
+        elig = jnp.broadcast_to(not_self, (C, W, W))
+
+    n_elig   = elig.sum(axis=-1)                           # (C,W)
+    has_pair = n_elig >= 2
+
+    # ---------- sample two distinct partners via masked Gumbel-max ----------
+    logits = jnp.where(elig, 0.0, -1e9)                    # (C,W,W)  eligible entries 0, else -inf
+    g1     = random.gumbel(key_partner, logits.shape)
+    idx_y  = jnp.argmax(logits + g1, axis=-1)              # (C,W)
+
+    # mask out y to sample distinct z
+    mask_y  = jax.nn.one_hot(idx_y, W, dtype=bool)         # (C,W,W)
+    elig2   = elig & (~mask_y)
+    logits2 = jnp.where(elig2, 0.0, -1e9)
+
+    key_partner2 = random.fold_in(key_partner, 1)
+    g2     = random.gumbel(key_partner2, logits2.shape)
+    idx_z  = jnp.argmax(logits2 + g2, axis=-1)             # (C,W)
+
+    # fallback to self if <2 partners (we'll no-op those below)
+    idx_y = jnp.where(has_pair, idx_y, arW[None, :])
+    idx_z = jnp.where(has_pair, idx_z, arW[None, :])
+
+    # gather partners and form the DE difference
+    Y = X[jnp.arange(C)[:, None], idx_y, :]                # (C,W,D)
+    Z = X[jnp.arange(C)[:, None], idx_z, :]                # (C,W,D)
+    diff = Y - Z                                           # (C,W,D)
+
+    # ---------- draw γ (symmetric) ----------
+    # If gamma=None: γ ~ Normal(0, σ^2) with σ = 2.38/sqrt(2D)  (classic DE)
+    # Else: use fixed |γ| but randomize sign to keep symmetry.
+    key_gam, key_aux = random.split(key_gamma)
+    if gamma is None:
+        sigma = gamma_scale / jnp.sqrt(2.0 * D)
+        gam = sigma * random.normal(key_gam, (C, W))       # (C,W)
+    else:
+        signs = jnp.where(random.uniform(key_gam, (C, W)) < 0.5, -1.0, 1.0)
+        gam = signs * float(gamma)
+
+    # ---------- crossover mask (C,W,D), ensure at least one True per (c,w) ----------
+    if crossover_rate >= 1.0:
+        mask = jnp.ones((C, W, D), dtype=bool)
+    else:
+        mask = random.bernoulli(key_aux, p=jnp.full((C, W, D), float(crossover_rate))).astype(bool)
+        # force at least one dim if all False
+        key_force = random.fold_in(key_aux, 2)
+        force_j   = random.randint(key_force, (C, W), 0, D)   # (C,W)
+        none_sel  = ~mask.any(axis=-1)                        # (C,W)
+        mask = mask.at[jnp.arange(C)[:, None], jnp.arange(W)[None, :], force_j].set(
+            jnp.where(none_sel, True, mask[jnp.arange(C)[:, None], jnp.arange(W)[None, :], force_j])
+        )
+
+    step = gam[..., None] * diff                             # (C,W,D)
+    step = jnp.where(mask, step, 0.0)
+
+    # ---------- jitter ε (optional; isotropic) ----------
+    if jitter_scale > 0.0:
+        key_eps = random.fold_in(key_aux, 3)
+        eps = jitter_scale * random.normal(key_eps, (C, W, D))
+    else:
+        eps = jnp.zeros_like(X)
+
+    # no-op where insufficient partners
+    X_prop = X + jnp.where(has_pair[..., None], step, 0.0) + eps
+
+    # ---------- proposal-density correction ----------
+    # Translation + symmetric γ (+ symmetric ε) => symmetric kernel => Δlog q = 0
+    # so no need to correct log q
+
+    return X_prop, idx_y, idx_z, has_pair, mask
+
+# prop_de, idx_y, idx_z, has_pair, mask = _propose_de_two_point(
+#     k_partner, k_gamma, Xth, z=z_at_prop,
+#     same_z_required=True, gamma=None, gamma_scale=2.38,
+#     crossover_rate=0.9, jitter_scale=1e-6
+# )
+
+# # ... compute prop_lp ...
+# log_alpha = (prop_lp - lp) / temperatures[:, None] + de_logq  # de_logq == 0 here
+
+
+# -------- stretch restricted to same z (self-avoiding; safe fallback when alone) --------
+def _propose_stretch_same_z(key_partner, key_scale, X, a: float = 2.0):
+    """
+    Goodman–Weare stretch where each (c,w) picks a partner among walkers at the
+    same chain 'c' that share the same model label 'z[c,w]'. Self-avoiding.
+    If no partner exists (group size == 1), returns (no-op, logJ=0, has_partner=False).
+    Args:
+      X: (C,W,D), z: (C,W)
+    Returns:
+      X_prop: (C,W,D), logJ: (C,W), has_partner: (C,W) bool
+    """
+    C, W, D = X.shape
+    arW = jnp.arange(W)
+
+    # eligible partners mask per (c,w): same z and not self
+    same_z   = (z[:, :, None] == z[:, None, :])                      # (C,W,W)
+    not_self = (arW[None, :, None] != arW[None, None, :])            # (1,W,W)
+    elig     = same_z & not_self                                     # (C,W,W)
+
+    has_partner = elig.any(axis=-1)                                  # (C,W)
+
+    # masked categorical via Gumbel-max: logits 0 for eligible, -inf for others
+    logits  = jnp.where(elig, 0.0, -1e9)
+    g       = jax.random.gumbel(key_partner, logits.shape)
+    partner = jnp.argmax(logits + g, axis=-1)                        # (C,W)
+
+    # fallback to self if none (we'll no-op those later)
+    partner = jnp.where(has_partner, partner, arW[None, :])
+    Y = X[jnp.arange(C)[:, None], partner, :]                        # (C,W,D)
+
+    # draw zfac ~ g(z) ∝ 1/sqrt(z) on [1/a, a]
+    u   = jax.random.uniform(key_scale, (C, W))
+    sa  = jnp.sqrt(a)
+    zcf = (u * (sa - 1.0 / sa) + 1.0 / sa) ** 2
+
+    X_prop = jnp.where(has_partner[..., None], Y + zcf[..., None] * (X - Y), X)
+    logJ   = jnp.where(has_partner, (D - 1) * jnp.log(zcf), 0.0)
+    return X_prop, logJ, has_partner

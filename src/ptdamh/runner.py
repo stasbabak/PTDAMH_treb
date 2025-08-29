@@ -42,7 +42,8 @@ from .proposals import (
     _propose_student_t,
     _propose_pcn,
     _pcn_logq_delta,
-    _propose_stretch_ensemble,
+    _propose_stretch,
+    _propose_de_two_point
 )
 
 from .utilities import (
@@ -223,6 +224,37 @@ class InfoAccumulator:
         return self.pack()
 
 
+@dataclass
+class SlimInfo:
+    accepted_points: list     # # accepted_points[c][w] -> np.ndarray of shape (N_acc_{c,w}, D)
+    accept_rate_per_cw: np.ndarray   # (C, W)  acceptance rate per (chain, walker)
+    accept_rate_per_c: np.ndarray    # (C,)    mean over walkers
+    swap_rate_per_w_edge: np.ndarray # (W, C-1) swap rate per walker & edge
+    swap_rate_per_edge: np.ndarray   # (C-1,)  mean over walkers
+
+
+@dataclass
+class SlimInfoPS:
+    # Per (chain=temp, walker), split by model label at proposal time
+    accepted_points_M2: list            # [C][W] -> np.ndarray (N2_{c,w}, D)
+    accepted_points_M3: list            # [C][W] -> np.ndarray (N3_{c,w}, D)
+    accepted_logprob_M2: list           # [C][W] -> np.ndarray (N2_{c,w},)
+    accepted_logprob_M3: list           # [C][W] -> np.ndarray (N3_{c,w},)
+
+    # Rates
+    accept_rate_per_cw: np.ndarray      # (C, W)
+    accept_rate_per_c:  np.ndarray      # (C,)
+    swap_rate_per_w_edge: np.ndarray    # (W, C-1)
+    swap_rate_per_edge:   np.ndarray    # (C-1,)
+
+    # z diagnostics
+    z_final: np.ndarray                 # (C, W) int {0,1}
+    z_time_in_M3: np.ndarray            # (C, W) fraction of steps with z==1
+    z_switch_count: np.ndarray          # (C, W)
+
+
+
+
 # ===== Device-resident, performance-first variant =====
 # - Whole epoch stays on device (jit + lax.scan)
 # - No per-chain branching: compute all 3 props, select by comp_idx
@@ -300,10 +332,12 @@ def run_epoch_device_fast(
         )  # (C, D)
         # prop2 = _propose_pcn(k4, th, means, fullcov["L_chol"], fullcov["scale_big"], beta=beta)
 
+
         props_all = jnp.stack([prop0, prop1, prop2], axis=0)  # (3, C, D)
         proposals = props_all[comp_idx, jnp.arange(C), :]  # (C, D)
-        proposals = _fold_params(proposals, fold_mask=fold_mask, period=period)
-
+        if fold_mask is not None:
+            proposals = _fold_params(proposals, fold_mask=fold_mask, period=period)
+        
         # batched likelihood
         prop_lp = batched_lp(proposals)
 
@@ -377,6 +411,7 @@ def run_epoch_device_fast(
         + jnp.full_like(init_state.n_swaps, n_steps),
     )
 
+
     info = StepInfo(
         thetas_prop=props,  # (T, C, D)
         logprob_prop=prop_lps,  # (T, C)
@@ -394,180 +429,11 @@ def run_epoch_device_fast(
 
 
 
-### with ensemble of walkers
-
-def run_epoch_device_fast_ensemble(
-    key,
-    init_state: PTState,                 # .thetas: (C, W, D), .log_probs: (C, W)
-    log_prob_fn_single,                  # (D,) -> ()
-    temperatures: jnp.ndarray,           # (C,)
-    covs: jnp.ndarray,                   # (C, D, D)
-    scale_small: jnp.ndarray,            # (C,)
-    scale_line: jnp.ndarray,             # (C,)
-    scale_big: jnp.ndarray,              # (C,)
-    comp_idx: jnp.ndarray,               # (C, W) in {0,1,2,3}; fixed this epoch
-    n_steps: int,
-    *,
-    lik_chunk: int = 32,
-    means: jnp.ndarray | None = None,    # (C, D) (unused here but kept for parity)
-    fold_mask: jnp.ndarray | None = None,# (D,)
-    period: float = 1.0,
-    do_swaps: bool = True,
-    stretch_a: float = 2.0,              # stretch parameter 'a'
-    nu: float = 5.0,                     # dof for Student-t component
-):
-    """
-    Ensemble epoch: (C temperatures) × (W walkers) with 4 proposal components:
-      0: Student-t (small)
-      1: Eigen-line
-      2: Full-cov (big)
-      3: Stretch move (Goodman–Weare)
-    """
-    C, W, D = init_state.thetas.shape
-
-    # precompute proposal "components" from covs like you do
-    fullcov, eigenline = _build_epoch_components(covs, scale_small, scale_line, scale_big)
-
-    # batched logprob over flattened (C*W, D)
-    batched_lp = _batched_logprob_chunked_fn(log_prob_fn_single, C * W, D, lik_chunk)
-
-    def _fold(X):
-        if fold_mask is None:
-            return X
-        Xf = X.reshape(C * W, D)
-        Xf = _fold_params(Xf, fold_mask=fold_mask, period=period)
-        return Xf.reshape(C, W, D)
-
-    def body(carry, key_t):
-        X, lp = carry  # (C,W,D), (C,W)
-        k0, k1, k2, k3, k4, k5, kU, kS = random.split(key_t, 8)
-
-        # ---------- component 0: Student-t (small) ----------
-        # eps ~ N(0,I), scale by Student-t radius
-        eps = random.normal(k0, shape=(C, W, D))
-        g = random.gamma(k1, a=nu / 2.0, shape=(C, W))    # chi2 via Gamma
-        r = jnp.sqrt(nu / (2.0 * g))                      # √(ν / χ²_ν)
-        # transform by chol (per C) and scale_small (per C)
-        # eps_t: (C,W,D) transformed noise
-        eps_t = jnp.einsum('cij,cwj->cwi', fullcov["L_chol"], eps * r[..., None])
-        prop0 = X + fullcov["scale_small"][:, None, None] * eps_t
-
-        # ---------- component 1: Eigen-line ----------
-        # choose axis per (C,W), then step along u_axis with variance S_axis
-        axis = random.randint(k2, shape=(C, W), minval=0, maxval=D)
-        gauss = random.normal(k3, shape=(C, W))
-        S_axis = jnp.take_along_axis(eigenline["S"], axis[:, :, None], axis=1)[:, :, 0]  # (C,W)
-        # unit direction u = U[:, :, axis]
-        U_axes = eigenline["U"][:, :, :]  # (C,D,D)
-        # gather u for each (C,W): (C,W,D)
-        u = U_axes[jnp.arange(C)[:, None], :, axis].transpose(0, 2, 1)  # (C,W,D)
-        step = (eigenline["scale"][:, None] * gauss * jnp.sqrt(S_axis))[..., None] * u
-        prop1 = X + step
-
-        # ---------- component 2: Full-cov (big) ----------
-        eps2 = random.normal(k4, shape=(C, W, D))
-        eps2_t = jnp.einsum('cij,cwj->cwi', fullcov["L_chol"], eps2)
-        prop2 = X + fullcov["scale_big"][:, None, None] * eps2_t
-
-        # ---------- component 3: Stretch move ----------
-        prop3, logJ_stretch, z_stretch = _propose_stretch_ensemble(k5, k5, X, a=stretch_a)
-
-        # stack and pick per-walker component
-        props_all = jnp.stack([prop0, prop1, prop2, prop3], axis=0)  # (4,C,W,D)
-        proposals = props_all[comp_idx, jnp.arange(C)[:, None], jnp.arange(W)[None, :], :]
-        proposals = _fold(proposals)
-
-        # batched logprob (flatten -> call -> reshape)
-        prop_lp = batched_lp(proposals.reshape(C * W, D)).reshape(C, W)
-
-        # base MH term (tempered)
-        delta = prop_lp - lp
-        log_alpha = delta / temperatures[:, None]
-
-        # add log Jacobian ONLY for stretch (comp==3)
-        is_stretch = (comp_idx == 3)
-        log_alpha = log_alpha + jnp.where(is_stretch, logJ_stretch, 0.0)
-
-        # accept/reject
-        u_log = jnp.log(random.uniform(kU, shape=(C, W)))
-        accept = u_log < log_alpha
-
-        X_new = jnp.where(accept[..., None], proposals, X)
-        lp_new = jnp.where(accept, prop_lp, lp)
-
-        # optional: parallel tempering swaps PER WALKER (vmap over W)
-        if do_swaps:
-            # split swap keys for W walkers
-            ks = random.split(kS, W)
-
-            def _swap_one(k, x_w, lp_w):
-                # x_w: (C,D), lp_w: (C,)
-                _, x_sw, lp_sw, swap_dec = parallel_tempering_swap(k, temperatures, x_w, lp_w)
-                return x_sw, lp_sw, swap_dec
-
-            xw = jnp.swapaxes(X_new, 0, 1)     # (W,C,D)
-            lpw = jnp.swapaxes(lp_new, 0, 1)   # (W,C)
-            x_sw, lp_sw, swaps = jax.vmap(_swap_one, in_axes=(0, 0, 0))(ks, xw, lpw)
-            X_out = jnp.swapaxes(x_sw, 0, 1)   # (C,W,D)
-            lp_out = jnp.swapaxes(lp_sw, 0, 1) # (C,W)
-            swap_dec = swaps                   # (W, C-1)
-        else:
-            X_out, lp_out = X_new, lp_new
-            swap_dec = jnp.zeros((W, C - 1), dtype=bool)
-
-        info_step = (proposals, prop_lp, accept, comp_idx, swap_dec)
-        # minimal debug like your single-walker version
-        dbg_step = (jnp.stack([prop_lp, lp, delta], axis=-1),
-                    log_alpha, u_log, accept & (u_log >= log_alpha))
-
-        return (X_out, lp_out), (info_step, dbg_step)
-
-    keys = random.split(key, n_steps)
-    (Xf, lpf), (info_pack, dbg_pack) = lax.scan(body, (init_state.thetas, init_state.log_probs), keys)
-
-    (props, prop_lps, accepts, comp_idxs, swaps) = info_pack  # props: (T,C,W,D), swaps: (T,W,C-1)
-    (deltas, log_alphas, u_logs, bad_acc) = dbg_pack
-
-    final_state = PTState(
-        thetas=Xf,
-        log_probs=lpf,
-        temperatures=init_state.temperatures,
-        n_accepted=init_state.n_accepted + accepts.sum(axis=(0, 2)).astype(jnp.int32),  # (C,)
-        n_swaps=init_state.n_swaps + swaps.sum(axis=(0, 1)).astype(jnp.int32),         # (C-1,)
-        n_swap_attempts=init_state.n_swap_attempts + jnp.full_like(init_state.n_swaps, n_steps * W),
-    )
-
-    info = StepInfo(
-        thetas_prop=props,         # (T, C, W, D)
-        logprob_prop=prop_lps,     # (T, C, W)
-        accepted=accepts,          # (T, C, W)
-        comp_idx=comp_idxs,        # (T, C, W)
-        swap_decisions=swaps,      # (T, W, C-1)
-    )
-    debug = {
-        "delta": deltas, "log_alpha": log_alphas, "u_log": u_logs, "bad_accept": bad_acc
-    }
-    return final_state, info, debug
 
 
 
-###################################################
-############ updates for the product space ########
-##################################################
 
-
-# --- indices for the 3 equal-sized signal blocks ---
-
-
-# ---------- product-space logposterior & z-Gibbs (+rejuvenation) ----------
-
-
-####################
-
-
-# ---------- the one-epoch product-space runner ----------
-
-
+# ---------- the one-epoch runner with product space----------
 def run_epoch_device_fast_M23(
     key,
     init_state,  # PTState with .thetas (C,D), .log_probs (C,), .z (C,)
@@ -673,6 +539,7 @@ def run_epoch_device_fast_M23(
 
         if fold_mask is not None:
             proposals = _fold_params(proposals, fold_mask=fold_mask, period=period)
+
 
         # --- MH under current z ---
         prop_lp = logpost(proposals, z_at_prop)  # (C,)
@@ -805,6 +672,9 @@ def run_epoch_device_fast_M23(
     }
     # return final_state, info, th_history, z_state_history, z_prop_history, debug
     return final_state, info, z_state_history, z_prop_history, debug
+
+
+
 
 
 # --- top-level adaptive runner (single-model OR product-space) ---
@@ -1083,3 +953,4 @@ def run_adaptive_pt_device_fast(
     out = info_accum.finalize()
     out["last_debug"] = last_debug
     return state, out
+

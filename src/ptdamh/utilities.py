@@ -299,18 +299,24 @@ def _batched_logprob_chunked_fn(log_prob_fn_single, C: int, D: int, chunk: int):
     return run
 
 
-def _fold_params(
-    x: jnp.ndarray, fold_mask: jnp.ndarray | None, period: float
-) -> jnp.ndarray:
+
+def _fold_params(x: jnp.ndarray,
+                 fold_mask: jnp.ndarray | None,
+                 period: float) -> jnp.ndarray:
     """
-    Fold selected dimensions into [0, period). fold_mask: (D,) with {0,1}; None -> no-op.
-    Works inside jit without Python loops.
+    Fold selected trailing dims into [0, period).
+    Works for x with shape (..., D); fold_mask is length-D of {0,1}.
     """
     if fold_mask is None:
         return x
-    x_mod = jnp.mod(x, period)
-    # broadcast mask to (C,D)
-    m = fold_mask[None, :]
+    # fold along the last axis only
+    x_mod = jnp.mod(x, period)  # [0, period)
+
+    # Build a mask of shape (..., D) that broadcasts over leading dims
+    # e.g. if x.ndim=3 and D=x.shape[-1], mask has shape (1,1,D)
+    reps = (1,) * (x.ndim - 1) + (x.shape[-1],)
+    m = fold_mask.reshape(reps).astype(x.dtype)
+
     return x * (1.0 - m) + x_mod * m
 
 
