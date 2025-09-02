@@ -18,7 +18,9 @@ from .proposals import (
     _propose_pcn,
     _pcn_logq_delta,
     _propose_stretch,
-    _propose_de_two_point
+    _propose_de_two_point,
+    redblue_mask,
+    _propose_stretch_redblue
 )
 
 from .utilities import (
@@ -61,7 +63,7 @@ def run_epoch_device_fast_ensemble(
     scale_small: jnp.ndarray,            # (C,)
     scale_line: jnp.ndarray,             # (C,)
     scale_big: jnp.ndarray,              # (C,)
-    comp_idx: jnp.ndarray,               # (C, W) in {0,1,2,3}; fixed this epoch
+    comp_idx: jnp.ndarray,               # (C, W) in {0,1,2,3, 4}; fixed this epoch
     n_steps: int,
     *,
     lik_chunk: int = 32,
@@ -98,9 +100,31 @@ def run_epoch_device_fast_ensemble(
     # beta = 0.3
     nu = 5.0
 
+    # one half-step: update only walkers in `mask`, anchors from complement
+    # def stretch_halfstep(keys, X, lp, temps, mask, z, a):
+    #     kp, ks, ku = keys
+    #     # propose stretch for *all*, but only `mask` entries will move; anchors drawn from complement inside
+    #     X_prop, logJ, partner, has_partner, zfac = _propose_stretch_redblue(
+    #         kp, ks, X, subset_mask=mask, a=a)
+        
+    #     # evaluate only once (safe to eval all; non-moving walkers will just reuse X)
+    #     C, W, D = X.shape
+    #     prop_lp = batched_lp(X_prop.reshape(C*W, D)).reshape(C, W)
+
+    #     # tempered MH + Jacobian only where we actually did a stretch move
+    #     delta = (prop_lp - lp) / temps[:, None]
+    #     log_alpha = jnp.where(mask, delta + logJ, -jnp.inf)      # -inf where not in this half
+
+    #     u_log = jnp.log(random.uniform(ku, (C, W)))
+    #     accept = mask & (u_log < log_alpha)
+
+    #     X_new  = jnp.where(accept[..., None], X_prop, X)
+    #     lp_new = jnp.where(accept,           prop_lp, lp)
+    #     return X_new, lp_new, accept
+
     def body(carry, key_t):
         Xth, lp = carry  # (C,W,D), (C,W)
-        k0, k1, k2, k3, k4, k5, kU, kS = random.split(key_t, 8)
+        k0, k1, k2, k3, k4, k5, kD, kU, kS = random.split(key_t, 9)
 
         prop0 = _propose_student_t(
             k0, k1, Xth, fullcov["L_chol"], fullcov["scale_small"], nu=nu)  # (C, W, D)
@@ -121,11 +145,23 @@ def run_epoch_device_fast_ensemble(
         prop3, logJ_stretch, partner, has_partner, zfac  = _propose_stretch(k5p, k5s, Xth, a=stretch_a, 
                                                                             z=None)
         # -------- component 4: DE two-point crossover ----------
-        k_partner, k_gamma= random.split(kU)
+        k_partner, k_gamma= random.split(kD)
         prop4, idx_y, idx_z, has_pair, mask = _propose_de_two_point(
                     k_partner, k_gamma, Xth, gamma=None, gamma_scale=2.38,
-                    crossover_rate=0.8, jitter_scale=1e-6
+                    crossover_rate=0.7, jitter_scale=1e-6
         )
+
+        ### Make it compulsory red-blue stretch-move
+
+        # # === stretch stage ===
+        # k_mask, k5p1, k5s1, k5p2, k5p2 = random.split(k_stretch, 5)
+        # red, blue = redblue_mask(k_mask, C, W)
+
+        # # half 1: update red, anchors from frozen blue
+        # Xth, lp, acc_red = stretch_halfstep((k5p1, k5s1, k5p2), Xth, lp, tempperatures, red, a=stretch_a)
+
+        # # half 2: update blue, anchors from updated red (now frozen while blue moves)
+        # Xth, lp, acc_blue = stretch_halfstep((k5p1, k5s1, k5p2), Xth, lp, temperatures, blue, a=stretch_a)
 
 #     k_partner, k_gamma, Xth, z=z_at_prop,
 #     same_z_required=True, gamma=None, gamma_scale=2.38,
@@ -135,6 +171,7 @@ def run_epoch_device_fast_ensemble(
         # We use all proposals but then select the proposed points of a particular proposal: easier
         # stack and pick per-walker component
         props_all = jnp.stack([prop0, prop1, prop2, prop3, prop4], axis=0)  # (5,C,W,D)
+        # props_all = jnp.stack([prop0, prop1, prop2, prop4, prop4], axis=0)  # (5,C,W,D)
         idx = comp_idx[None, :, :, None]                  # (1, C, W, 1)
         proposals = jnp.take_along_axis(
             props_all,                                    # (4, C, W, D)
@@ -225,19 +262,23 @@ def run_epoch_device_fast_ensemble(
     props_np   = np.asarray(proposals)        # (T,C,W,D)
     accepts_np = np.asarray(accepts)          # (T,C,W)
     swaps_np   = np.asarray(swaps)            # (T,W,C-1)
+    lps_np     = np.asarray(prop_lps)    # (T,C,W)
+    
 
     T, C, W, D = props_np.shape
 
     # ----- Per-(chain,walker) accepted points (ragged lists) -----
     accepted_points = [[None for _ in range(W)] for _ in range(C)]
+    accepted_logprobs  = [[None for _ in range(W)] for _ in range(C)]
+
     accept_rate_per_cw = np.zeros((C, W), dtype=np.float64)
 
     for c in range(C):
         for w in range(W):
             mask = accepts_np[:, c, w]                  # (T,)
-            pts  = props_np[mask, c, w, :]              # (N_acc_{c,w}, D)
-            accepted_points[c][w] = pts                 # store ragged array
-            accept_rate_per_cw[c, w] = float(mask.mean())
+            accepted_points[c][w]   = props_np[mask, c, w, :]   # (N_acc, D)
+            accepted_logprobs[c][w] = lps_np[mask, c, w]        # (N_acc,)
+            accept_rate_per_cw[c, w] = float(mask.mean()) if T > 0 else 0.0
 
     # Chain- and edge-level summaries (optional but handy)
     accept_rate_per_c   = accept_rate_per_cw.mean(axis=1)        # (C,)
@@ -247,6 +288,7 @@ def run_epoch_device_fast_ensemble(
 
     slim = SlimInfo(
         accepted_points=accepted_points, 
+        accepted_logprobs=accepted_logprobs,
         accept_rate_per_cw=accept_rate_per_cw,
         accept_rate_per_c=accept_rate_per_c,
         swap_rate_per_w_edge=swap_rate_per_w_edge,
@@ -555,15 +597,23 @@ def run_epoch_device_fast_M23_ensemble(
     )
 
     # final state
+    # accepts: (T, C, W)
+    n_accepted = init_state.n_accepted + accepts.sum(axis=(0, 2)).astype(jnp.int32)  # (C,)
+
+    # swaps: (T, W, C-1)  -> sum over time and walkers -> (C-1,)
+    n_swaps = init_state.n_swaps + swaps.sum(axis=(0, 1)).astype(jnp.int32)
+
     final_state = type(init_state)(
         thetas=th_f,
         log_probs=lp_f,
         temperatures=init_state.temperatures,
-        n_accepted=init_state.n_accepted + accepts.sum(axis=(0, 1)).astype(jnp.int32),   # sum over T & W per chain
-        n_swaps=init_state.n_swaps + swaps.sum(axis=(0, 1)).astype(jnp.int32),          # (C-1,)
-        n_swap_attempts=init_state.n_swap_attempts + jnp.full_like(init_state.n_swaps, n_steps * W),
+        n_accepted=n_accepted,
+        n_swaps=n_swaps,
+        n_swap_attempts=init_state.n_swap_attempts
+            + jnp.full_like(init_state.n_swaps, n_steps * W),
         z=z_f,
     )
+
 
     # StepInfo-like container (now ensemble-shaped)
     # info = StepInfo(
@@ -677,20 +727,25 @@ def run_adaptive_pt_device_fast(
         i3 = slice(2 * Npar_src, 3 * Npar_src)
         iR = slice(min(3 * Npar_src, D), D)
 
-        def _flat(X):   # (C,W,D)->(C*W,D)
-            return X.reshape(C * W, D)
-        def _unflat(v): # (C*W,)->(C,W)
+        C, W, D = initial_thetas.shape
+        X = initial_thetas
+
+        def _flat(X):        # (..., Dk) -> (C*W, Dk)  (Dk can differ for M2/M3)
+            return X.reshape(C * W, X.shape[-1])
+
+        def _unflat(v):      # (C*W,) -> (C, W)
             return v.reshape(C, W)
 
-        f2 = jax.jit(jax.vmap(loglik_M2_single))
-        f3 = jax.jit(jax.vmap(loglik_M3_single))
+        # vmap single-point fns across leading dim
+        f2 = jax.jit(jax.vmap(loglik_M2_single))  # (N, D_M2) -> (N,)
+        f3 = jax.jit(jax.vmap(loglik_M3_single))  # (N, D_M3) -> (N,)
 
-        X = initial_thetas
-        X2_args = jnp.concatenate([X[..., i1], X[..., i2], X[..., iR]], axis=-1)
-        X3_args = jnp.concatenate([X[..., i1], X[..., i2], X[..., i3], X[..., iR]], axis=-1)
+        X2_args = jnp.concatenate([X[..., i1], X[..., i2], X[..., iR]], axis=-1) # (C, W, D_M2)
+        X3_args = jnp.concatenate([X[..., i1], X[..., i2], X[..., i3], X[..., iR]], axis=-1) # (C, W, D_M3)
 
-        lp2 = _unflat(f2(_flat(X2_args)))
-        lp3 = _unflat(f3(_flat(X3_args)))
+        lp2 = _unflat(f2(_flat(X2_args))) # (C, W)
+        lp3 = _unflat(f3(_flat(X3_args))) # (C, W)
+
 
         if psi3_logpdf is None:
             lp_psi = jnp.zeros((C, W), dtype=X.dtype)

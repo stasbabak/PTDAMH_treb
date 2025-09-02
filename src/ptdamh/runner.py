@@ -55,6 +55,7 @@ from .utilities import (
     _empirical_cov_wrapped,
     PTState,
     StepInfo,
+    AdaptConfig,
     _pt_swap_core,
     _pt_swap_core_parity,
     parallel_tempering_swap,
@@ -71,23 +72,6 @@ from .utilities import (
 
 
 # ------------------------- Adaptive driver (m epochs) -------------------------
-@dataclass
-class AdaptConfig:
-    m_epochs: int = 6
-    N_steps: int = 500
-    target_accept: float = 0.234
-    eta: float = 0.05  # Robbins–Monro adaptation rate
-    scale_init: float = 1.0
-    scale_min: float = 0.1
-    scale_max: float = 10.0
-    shrink: float = 0.1
-    jitter: float = 1e-6
-    kappa_line: float = 3.0
-    beta_base: float = 0.3
-    beta_temp_scale: bool = True
-    cov_mode: str = "rolling"  # "rolling" or "all_states"
-    window_size: int = 10_000  # rolling window size
-    downsample_every: int = 2  # store every k-th post-swap state into buffers
 
 
 class InfoAccumulator:
@@ -223,34 +207,6 @@ class InfoAccumulator:
     def finalize(self):
         return self.pack()
 
-
-@dataclass
-class SlimInfo:
-    accepted_points: list     # # accepted_points[c][w] -> np.ndarray of shape (N_acc_{c,w}, D)
-    accept_rate_per_cw: np.ndarray   # (C, W)  acceptance rate per (chain, walker)
-    accept_rate_per_c: np.ndarray    # (C,)    mean over walkers
-    swap_rate_per_w_edge: np.ndarray # (W, C-1) swap rate per walker & edge
-    swap_rate_per_edge: np.ndarray   # (C-1,)  mean over walkers
-
-
-@dataclass
-class SlimInfoPS:
-    # Per (chain=temp, walker), split by model label at proposal time
-    accepted_points_M2: list            # [C][W] -> np.ndarray (N2_{c,w}, D)
-    accepted_points_M3: list            # [C][W] -> np.ndarray (N3_{c,w}, D)
-    accepted_logprob_M2: list           # [C][W] -> np.ndarray (N2_{c,w},)
-    accepted_logprob_M3: list           # [C][W] -> np.ndarray (N3_{c,w},)
-
-    # Rates
-    accept_rate_per_cw: np.ndarray      # (C, W)
-    accept_rate_per_c:  np.ndarray      # (C,)
-    swap_rate_per_w_edge: np.ndarray    # (W, C-1)
-    swap_rate_per_edge:   np.ndarray    # (C-1,)
-
-    # z diagnostics
-    z_final: np.ndarray                 # (C, W) int {0,1}
-    z_time_in_M3: np.ndarray            # (C, W) fraction of steps with z==1
-    z_switch_count: np.ndarray          # (C, W)
 
 
 

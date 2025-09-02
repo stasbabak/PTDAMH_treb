@@ -655,6 +655,48 @@ def _propose_stretch(
     return X_prop, logJ, partner, has_partner, zfac
 
 
+def redblue_mask(key, C, W):
+    # per temperature, choose half the walkers as "red"
+    perm = random.permutation(key, W, independent=True)      # shape (W,) per vmapped C
+    # vmapping over C for clarity
+    def _mk(perm_row):
+        half = W // 2
+        red = jnp.zeros(W, dtype=bool).at[perm_row[:half]].set(True)
+        return red
+    red = jax.vmap(_mk)(perm)                                # (C, W)
+    return red, ~red
+
+# add: subset_mask says who is being updated this half-step (red)
+# only choose partners from the complement (~subset_mask)
+def _propose_stretch_redblue(key_partner, key_scale, X, subset_mask, a=2.0, z=None):
+    C, W, D = X.shape
+    comp = ~subset_mask                         # (C, W)
+    arW = jnp.arange(W)
+
+    # build eligibility: non-self & in complement; optionally same label
+    not_self = (arW[None,:,None] != arW[None,None,:])        # (1,W,W)
+    comp_mat = comp[:, None, :]                              # (C,1,W)
+    elig = jnp.broadcast_to(not_self, (C,W,W)) & comp_mat    # (C,W,W)
+    if z is not None:
+        elig &= (z[:,:,None] == z[:,None,:])
+
+    # only sample partners for the subset being moved
+    logits = jnp.where(elig & subset_mask[:,:,None], 0.0, -jnp.inf)
+    g = jax.random.gumbel(key_partner, logits.shape)
+    partner = jnp.argmax(logits + g, axis=-1)
+    has_partner = (elig & subset_mask[:,:,None]).any(axis=-1)
+
+    Y = X[jnp.arange(C)[:,None], partner, :]
+    u = jax.random.uniform(key_scale, (C,W))
+    sa = jnp.sqrt(a)
+    zfac = (u*(sa - 1/sa) + 1/sa)**2
+
+    do_move = subset_mask & has_partner
+    X_prop = jnp.where(do_move[...,None], Y + zfac[...,None]*(X - Y), X)
+
+    logJ = jnp.where(do_move, (D - 1.0)*jnp.log(zfac), 0.0)
+    return X_prop, logJ, partner, has_partner, zfac
+
 
 def _propose_de_two_point(
     key_partner,
