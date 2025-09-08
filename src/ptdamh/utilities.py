@@ -12,6 +12,14 @@ import jax.numpy as jnp
 from jax import random
 
 
+######################################################################
+############.  New attempt #######################
+
+
+
+
+
+
 # ------------------------- Temperature/covariance helpers -------------------------
 
 
@@ -160,7 +168,10 @@ class SlimInfoPS:
 
 # ------------------------- Parallel tempering swap -------------------------
 
+### new PT swap implementation 
 
+
+################################
 @jax.jit
 def _pt_swap_core(key, temperatures, thetas, log_probs):
     C = thetas.shape[0]

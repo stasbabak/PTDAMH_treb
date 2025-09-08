@@ -1,5 +1,10 @@
 
 """Proposal utilities for parallel tempering samplers."""
+
+# from __future__ import annotations
+# from dataclasses import dataclass
+# from typing import Callable, NamedTuple, Optional, Dict, Tuple
+
 import jax
 import jax.numpy as jnp
 from jax import random, vmap
@@ -7,6 +12,11 @@ import jax.scipy as jsp
 import numpy as np
 from jax.scipy.special import gammaln
 from jax.scipy.linalg import solve_triangular
+
+
+import jax
+import jax.numpy as jnp
+from jax import random, lax
 
 
 # ---------- helpers ----------
@@ -59,6 +69,28 @@ def safe_cholesky(SPD):
 def log_normal_1d(x, mean, var):
     return -0.5 * (jnp.log(2.0 * jnp.pi * var) + (x - mean) ** 2 / var)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######################. Old code from here down.  ######################
 
 # ---------- (1) Full-covariance Gaussian proposal ----------
 def make_fullcov_proposal(cov, fold_idx=(), period=1.0):
@@ -407,7 +439,7 @@ def _as_ensemble(x):
     C, W, D = x.shape
     return x, C, W, D, squeeze
 
-def _propose_fullcov(key, x, L, scale):
+def _propose_fullcov(key, x, L, scale=None):
     """Full-covariance Gaussian random walk proposal.
         Accepts x of shape (C,D) or (C,W,D). Returns same rank as x.
     """
@@ -415,6 +447,7 @@ def _propose_fullcov(key, x, L, scale):
     z = random.normal(key, (C, W, D))
     # transform noise per chain via Cholesky
     eps = jnp.einsum("cij,cwj->cwi", L, z)  # (C,W,D)
+    # eps = jnp.einsum("ij,wj->wi", L, z)  # (W,D)
     # scaling
     # scale_c = jnp.asarray(scale)            # () or (C,)
     # if scale_c.ndim == 0:
@@ -427,7 +460,7 @@ def _propose_fullcov(key, x, L, scale):
     return out[:, 0, :] if squeeze else out
 
 
-def _propose_eigenline(key_axis, key_noise, x, U, S, scale, axis_logits=None):
+def _propose_eigenline(key_axis, key_noise, x, U, S, scale=None, axis_logits=None):
     """Propose along a single eigen-direction for each chain."""
     x, C, W, D, squeeze = _as_ensemble(x)
 
@@ -466,8 +499,38 @@ def _propose_eigenline(key_axis, key_noise, x, U, S, scale, axis_logits=None):
     out = x + step * U_ax
     return out[:, 0, :] if squeeze else out
 
+# def _propose_eigenline(key_axis, key_noise, x, U, S, scale=None, axis_logits=None):
+#     """Propose along a single eigen-direction for each chain."""
+#     x, C, W, D, squeeze = _as_ensemble(x)
 
-def _propose_student_t(key_norm, key_gamma, x, L, scale, nu=5.0):
+#     # choose axis per (C,W)
+#     if axis_logits is None:
+#         axes = random.randint(key_axis, (C, W), 0, D)  # (C,W)
+#     else:
+#         lg = jnp.asarray(axis_logits)
+#         # This part of the logic assumes C > 1, but inside the vmap C=1.
+#         # The logic needs to be simplified for a single chain.
+#         # Assuming lg is (W, D) or (D,)
+#         if lg.ndim == 1: # (D,)
+#              lg = jnp.broadcast_to(lg, (W, D))
+#         # Now lg is (W, D)
+#         ks = random.split(key_axis, W)
+#         axes = vmap(lambda lg_w, k: random.categorical(k, lg_w))(lg, ks) # (W,)
+#         axes = axes[None, :] # -> (1, W) to match C=1
+
+#     # gather eigenvectors/eigenvalues for chosen axis
+#     # U is (D,D), axes is (1,W)
+#     U_ax = U[:, axes[0,:]]            # (D,W)
+#     S_ax = S[axes[0,:]]               # (W,)
+
+#     r = random.normal(key_noise, (C, W))
+#     step = ( r * jnp.sqrt(S_ax))[..., None]  # (C,W,1)
+#     # U_ax is (D,W), needs to be (C,W,D) for broadcast
+#     out = x + step * U_ax.transpose(1,0)[None,:,:]
+#     return out[:, 0, :] if squeeze else out
+
+
+def _propose_student_t(key_norm, key_gamma, x, L, scale=None, nu=5.0):
     """Student-t random walk proposal."""
     x, C, W, D, squeeze = _as_ensemble(x)
 
@@ -482,6 +545,7 @@ def _propose_student_t(key_norm, key_gamma, x, L, scale, nu=5.0):
     t = z / jnp.sqrt(g[..., None])                                    # (C,W,D)
 
     t_tr = jnp.einsum("cij,cwj->cwi", L, t)                           # (C,W,D)
+    # t_tr = jnp.einsum("ij,cwj->cwi", L, t)  # (W,D)
 
     # scale_c = jnp.asarray(scale)
     # if scale_c.ndim == 0:
@@ -656,14 +720,26 @@ def _propose_stretch(
 
 
 def redblue_mask(key, C, W):
-    # per temperature, choose half the walkers as "red"
-    perm = random.permutation(key, W, independent=True)      # shape (W,) per vmapped C
-    # vmapping over C for clarity
-    def _mk(perm_row):
-        half = W // 2
-        red = jnp.zeros(W, dtype=bool).at[perm_row[:half]].set(True)
-        return red
-    red = jax.vmap(_mk)(perm)                                # (C, W)
+    """Return boolean masks (C, W) for red/blue split per temperature.
+
+    Accepts either a single PRNG key shape (2,) or a batch of keys shape (C, 2).
+    Internally vmaps permutation per temperature to avoid relying on
+    batched-keys support in jax.random.permutation.
+    """
+    # normalize key to (C, 2)
+    if hasattr(key, "shape") and key.shape == (2,):
+        keys = random.split(key, C)               # (C, 2)
+    else:
+        keys = key                                # assume already (C, 2)
+
+    # permutation per temperature -> (C, W)
+    perms = jax.vmap(lambda k: random.permutation(k, W))(keys)
+
+    half = W // 2
+    def _mk(pr):
+        return jnp.zeros(W, dtype=bool).at[pr[:half]].set(True)
+
+    red = jax.vmap(_mk)(perms)                    # (C, W)
     return red, ~red
 
 # add: subset_mask says who is being updated this half-step (red)
