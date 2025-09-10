@@ -30,6 +30,42 @@ class PTTrace(NamedTuple): ## records the chain (for each temperature, each walk
     thetas: jnp.ndarray       # (T+1, C, W, D)
     log_probs: jnp.ndarray    # (T+1, C, W)
 
+@dataclass
+class PTTrace2:
+    thetas: jnp.ndarray       # (max_length, C, W, D)
+    log_probs: jnp.ndarray    # (max_length, C, W)
+    max_length: int
+    current_index: int = 0    # points to last written entry
+
+    @classmethod
+    def init(cls, max_length: int, C: int, W: int, D: int, dtype=jnp.float32):
+        thetas = jnp.zeros((max_length, C, W, D), dtype=dtype)
+        log_probs = jnp.zeros((max_length, C, W), dtype=dtype)
+        return cls(thetas, log_probs, max_length, 0)
+
+    def append(self, state: "PTState"):
+        """
+        Append a new state (thetas, log_probs) at current_index.
+        Returns a new PTTrace with current_index incremented.
+        """
+        idx = self.current_index
+        if idx >= self.max_length:
+            raise RuntimeError("PTTrace buffer overflow: increase max_length")
+        thetas = self.thetas.at[idx].set(state.thetas)
+        log_probs = self.log_probs.at[idx].set(state.log_probs)
+        return PTTrace(thetas, log_probs, self.max_length, idx + 1)
+
+    def truncate(self):
+        """
+        Trim arrays to length = current_index for output/analysis.
+        """
+        return PTTrace(
+            thetas=self.thetas[:self.current_index],
+            log_probs=self.log_probs[:self.current_index],
+            max_length=self.current_index,
+            current_index=self.current_index,
+        )
+
 
 # Proposal IDs for logging (int8-friendly)
 PROPOSAL_IDS: Dict[str, int] = {

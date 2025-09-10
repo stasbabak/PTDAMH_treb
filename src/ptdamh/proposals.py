@@ -785,6 +785,7 @@ def _propose_de_two_point(
     gamma_scale: float = 2.38,     # σ = gamma_scale / sqrt(2D) when gamma is None (classic DE)
     crossover_rate: float = 0.8,   # per-dimension prob to update (DE "CR"); set 1.0 for full update
     jitter_scale: float = 0.0,     # ε ~ N(0, jitter_scale^2 I) (small)
+    eligible_mask: jnp.ndarray | None = None,   # <<< NEW: (C,W) True => can be used as parent/partner
 ):
     """
     Differential-Evolution (two-point) proposal for each (c,w):
@@ -807,11 +808,23 @@ def _propose_de_two_point(
     not_self = (arW[None, :, None] != arW[None, None, :])  # (1,W,W) -> broadcast
     if (z is not None) and same_z_required:
         same_lbl = (z[:, :, None] == z[:, None, :])        # (C,W,W)
-        elig = same_lbl & not_self
+        # elig = same_lbl & not_self
     else:
-        elig = jnp.broadcast_to(not_self, (C, W, W))
+        same_lbl = jnp.ones((C, W, W), dtype=bool)
+        # elig = jnp.broadcast_to(not_self, (C, W, W))
 
-    n_elig   = elig.sum(axis=-1)                           # (C,W)
+    if eligible_mask is None:
+        elig_external = jnp.ones((C, W), dtype=bool)
+    else:
+        elig_external = eligible_mask.astype(bool)                  # (C,W)
+
+    # partners for (c,w) must come from those with eligible_mask==True
+    # broadcast: elig_external over partner axis
+    elig_pool = elig_external[:, None, :]                           # (C,1,W) -> (C,W,W) after broadcast
+
+    elig = same_lbl & not_self & elig_pool                          # (C,W,W)
+
+    n_elig   = elig.sum(axis=-1)                                    # (C,W)
     has_pair = n_elig >= 2
 
     # ---------- sample two distinct partners via masked Gumbel-max ----------
