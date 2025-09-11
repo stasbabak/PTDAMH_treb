@@ -1,6 +1,6 @@
 # src/ptdamh/BD_MH_step_numpy.py
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Literal, List
 
 import numpy as np
@@ -22,6 +22,9 @@ from .proposals import (
 # =============================================================================
 #                                State containers
 # =============================================================================
+
+MOVE_IDS = {"stretch": 0, "rw_fullcov": 1, "rw_eigenline": 2,
+            "rw_student_t": 3, "de": 4, "ptswap": 5}
 
 @dataclass
 class PTState: # for parallel tempering state
@@ -64,6 +67,111 @@ class MHEvent:  ## Metropolis-Hastings Process event storage
 class EventLog:
     bd_events: List[BDEvent]
     mh_events: List[MHEvent]
+
+
+@dataclass
+class TraceConfig:
+    # Which temperature indices to snapshot (None => all C)
+    chain_inds: Optional[List[int]] = None
+
+# ---- Snapshots captured after each submove ----
+@dataclass
+class SubmoveSnapshot:
+    move_id: int                  # as in MOVE_IDS
+    slot_j: int                   # -1 for PT swap
+    accepted: np.ndarray          # (C,W) bool
+    # selected chains (Csel) snapshots AFTER the submove
+    thetas_sel: np.ndarray        # (Csel, W, D)
+    ll_sel: np.ndarray            # (Csel, W)   masked log-lik
+    phi_sel: np.ndarray           # (Csel, W, Kmax, d)
+    m_sel: np.ndarray             # (Csel, W, Kmax) bool
+    logpi_sel: np.ndarray         # (Csel, W)
+
+# ---- One MH tick groups all its submoves ----
+@dataclass
+class MHTick:
+    t_abs: float
+    dt: float
+    submoves: List[SubmoveSnapshot] = field(default_factory=list)
+
+
+# ---- BD event + optional PS snapshot (selected chains) ----
+@dataclass
+class BDEventWithState:
+    t_abs: float
+    dt: float
+    kind: int         # 0=birth, 1=death
+    c: int
+    w: int
+    slot: int
+    k_before: int
+    k_after: int
+    # optional selected-chain PS snapshot AFTER the BD event
+    phi_sel: Optional[np.ndarray] = None   # (Csel, W, Kmax, d)
+    m_sel: Optional[np.ndarray]   = None   # (Csel, W, Kmax)
+    logpi_sel: Optional[np.ndarray]= None  # (Csel, W)
+
+
+# ---- Top-level run trace ----
+@dataclass
+class RunTrace:
+    cfg: TraceConfig
+    betas: np.ndarray             # (C,)
+    chain_inds: np.ndarray        # (Csel,)
+    C: int; W: int; D: int; Kmax: int; d: int
+
+    # event streams
+    bd_events: List[BDEventWithState] = field(default_factory=list)
+    mh_ticks:  List[MHTick]           = field(default_factory=list)
+
+    # ---- helpers ----
+    @staticmethod
+    def init(cfg: TraceConfig, betas: np.ndarray, W: int, D: int, Kmax: int, d: int) -> "RunTrace":
+        C = int(betas.shape[0])
+        if cfg.chain_inds is None:
+            chain_inds = np.arange(C, dtype=np.int32)
+        else:
+            chain_inds = np.array(cfg.chain_inds, dtype=np.int32)
+        return RunTrace(cfg=cfg, betas=np.asarray(betas), chain_inds=chain_inds,
+                        C=C, W=W, D=D, Kmax=Kmax, d=d)
+
+    def _sel(self, arr: np.ndarray) -> np.ndarray:
+        """Select configured temperature indices."""
+        return arr[self.chain_inds]
+
+    # record a BD event + (optionally) PS snapshot of selected chains
+    def add_bd_event(self, ev, ps: "PSState", with_snapshot: bool = True):
+        rec = BDEventWithState(
+            t_abs=ev.t_abs, dt=ev.dt, kind=ev.kind,
+            c=ev.c, w=ev.w, slot=ev.slot,
+            k_before=ev.k_before, k_after=ev.k_after,
+        )
+        if with_snapshot:
+            rec.phi_sel   = self._sel(ps.phi).copy()
+            rec.m_sel     = self._sel(ps.m).copy()
+            rec.logpi_sel = self._sel(ps.logpi).copy()
+        self.bd_events.append(rec)
+
+    # start a new MH tick (call once per tick)
+    def begin_mh_tick(self, t_abs: float, dt: float):
+        self.mh_ticks.append(MHTick(t_abs=t_abs, dt=dt))
+
+    # add a submove snapshot to the current (most recent) MH tick
+    def add_submove_snapshot(self, move_type: str, slot_j: int,
+                             accepted_mask: np.ndarray,
+                             pt: "PTState", ps: "PSState"):
+        assert len(self.mh_ticks) > 0, "begin_mh_tick() before adding submoves"
+        snap = SubmoveSnapshot(
+            move_id=MOVE_IDS[move_type],
+            slot_j=int(slot_j),
+            accepted=accepted_mask.copy(),
+            thetas_sel=self._sel(pt.thetas).copy(),
+            ll_sel=self._sel(pt.log_probs).copy(),
+            phi_sel=self._sel(ps.phi).copy(),
+            m_sel=self._sel(ps.m).copy(),
+            logpi_sel=self._sel(ps.logpi).copy(),
+        )
+        self.mh_ticks[-1].submoves.append(snap)
 
 
 # =============================================================================
@@ -417,6 +525,31 @@ def pt_swap_pass_numpy(
 
     return PTState(thetas=th, log_probs=lp), acc_mask, att_mask
 
+### need to swap the whole state
+def ps_swap_pass_inplace(
+    ps_state: PSState,
+    accept_pairs: np.ndarray,   # (C,W) from pt_swap_pass_numpy
+    even_pass: bool,
+) -> None:
+    """Mirror the accepted PT swaps onto PSState (phi, m, rest, logpi)."""
+    C, W, Kmax, d = ps_state.phi.shape
+    start = 0 if even_pass else 1
+    idx_low  = np.arange(start, C-1, 2, dtype=np.int32)
+    idx_high = idx_low + 1
+
+    for p in range(idx_low.shape[0]):
+        i = idx_low[p]; j = idx_high[p]
+        mask_w = accept_pairs[i]             # (W,) booleans for walkers at this pair
+        if not mask_w.any():
+            continue
+        # swap (φ, m, rest, logπ) at (i,<mask_w>) <-> (j,<mask_w>)
+        mw = mask_w
+        ps_state.phi[i, mw],  ps_state.phi[j, mw]  = ps_state.phi[j, mw].copy(),  ps_state.phi[i, mw].copy()
+        ps_state.m[i, mw],    ps_state.m[j, mw]    = ps_state.m[j, mw].copy(),    ps_state.m[i, mw].copy()
+        if ps_state.rest is not None:
+            ps_state.rest[i, mw], ps_state.rest[j, mw] = ps_state.rest[j, mw].copy(), ps_state.rest[i, mw].copy()
+        ps_state.logpi[i, mw], ps_state.logpi[j, mw] = ps_state.logpi[j, mw].copy(), ps_state.logpi[i, mw].copy()
+
 # =============================================================================
 #     JAX masked-likelihood: single-config -> scalar  (YOU MUST PROVIDE)
 # =============================================================================
@@ -691,31 +824,7 @@ def _scatter_into(full: np.ndarray, idx: tuple[np.ndarray,np.ndarray], vals: np.
     out[idx] = vals
     return out
 
-def _masked_ll_subset(phi_full: np.ndarray,
-                      m_full: np.ndarray,
-                      rest_full: Optional[np.ndarray],
-                      idx: tuple[np.ndarray,np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Evaluate masked LL only on subset 'idx', return (vals, full_with_vals).
-    """
-    if idx[0].size == 0:
-        return np.empty((0,), dtype=np.float64), None
-    C, W, Kmax, d = phi_full.shape
-    # pack subset into a batch
-    phi_sub  = phi_full[idx][:, :, :]         # (B_sub, Kmax, d)
-    m_sub    = m_full[idx][:, :]              # (B_sub, Kmax)
-    rest_sub = None if rest_full is None else rest_full[idx][:, :]
-    ll_sub = batched_loglik_masked(phi_sub, m_sub, rest_sub)  # (B_sub,)
-    return ll_sub, _scatter_into(np.zeros((C, W), dtype=np.float64), idx, ll_sub)
 
-def _slot_prior_subset(phi_slot_full: np.ndarray, idx: tuple[np.ndarray,np.ndarray]) -> np.ndarray:
-    """Compute prior for φ_j only on subset; returns 1D (B_sub,)"""
-    if idx[0].size == 0:
-        return np.empty((0,), dtype=np.float64)
-    vals = np.empty(idx[0].shape[0], dtype=np.float64)
-    for n, (c, w) in enumerate(zip(idx[0], idx[1])):
-        vals[n] = float(log_prior_phi_np(phi_slot_full[c, w]))
-    return vals
 
 
 # =============================================================================
@@ -751,6 +860,7 @@ def gibbs_mh_sweep_active_np(
     gamma_de: float = 2.38,
     # logging
     event_log: Optional[EventLog] = None,
+    run_trace: Optional["RunTrace"] = None,
 ) -> PTState:
     
     C, W, D = pt_state.thetas.shape
@@ -779,6 +889,32 @@ def gibbs_mh_sweep_active_np(
             None if rest is None else rest.reshape(B, -1)
         ).reshape(C, W)
         return np.asarray(ll, dtype=np.float64)
+
+    def _masked_ll_subset(phi_full: np.ndarray,
+                      m_full: np.ndarray,
+                      rest_full: Optional[np.ndarray],
+                      idx: tuple[np.ndarray,np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Evaluate masked LL only on subset 'idx', return (vals, full_with_vals).
+        """
+        if idx[0].size == 0:
+            return np.empty((0,), dtype=np.float64), None
+        C, W, Kmax, d = phi_full.shape
+        # pack subset into a batch
+        phi_sub  = phi_full[idx][:, :, :]         # (B_sub, Kmax, d)
+        m_sub    = m_full[idx][:, :]              # (B_sub, Kmax)
+        rest_sub = None if rest_full is None else rest_full[idx][:, :]
+        ll_sub = batched_loglik_masked(phi_sub, m_sub, rest_sub)  # (B_sub,)
+        return ll_sub, _scatter_into(np.zeros((C, W), dtype=np.float64), idx, ll_sub)
+
+    def _slot_prior_subset(phi_slot_full: np.ndarray, idx: tuple[np.ndarray,np.ndarray]) -> np.ndarray:
+        """Compute prior for φ_j only on subset; returns 1D (B_sub,)"""
+        if idx[0].size == 0:
+            return np.empty((0,), dtype=np.float64)
+        vals = np.empty(idx[0].shape[0], dtype=np.float64)
+        for n, (c, w) in enumerate(zip(idx[0], idx[1])):
+            vals[n] = float(log_prior_phi_np(phi_slot_full[c, w]))
+        return vals
 
     # --- end helpers ----------------------------------------------------------
 
@@ -870,6 +1006,11 @@ def gibbs_mh_sweep_active_np(
             ps_state.phi[:, :, j, :] = np.where(accept[:, :, None], prop2[:, :, slot_sel], ps_state.phi[:, :, j, :])
             ll_cur       = np.where(accept, ll_prop, ll_cur)
             lprior_cur_j = np.where(accept, lprior_prop_j_full, lprior_cur_j)
+            if run_trace is not None:
+                run_trace.add_submove_snapshot(
+                    move_type="stretch", slot_j=j, accepted_mask=accept,
+                    pt=pt_state, ps=ps_state
+                )
 
         # --- RW fullcov ---
         if do_rw_fullcov and (Ls is not None):
@@ -911,6 +1052,11 @@ def gibbs_mh_sweep_active_np(
             # carry-forward only where accepted
             ll_cur       = np.where(accept, ll_prop, ll_cur)
             lprior_cur_j = np.where(accept, lprior_prop_j_full, lprior_cur_j)
+            if run_trace is not None:
+                run_trace.add_submove_snapshot(
+                    move_type="rw_fullcov", slot_j=j, accepted_mask=accept,
+                    pt=pt_state, ps=ps_state
+                )
 
         # --- RW eigenline ---
         if do_rw_eigenline and (U is not None) and (S is not None):
@@ -953,6 +1099,11 @@ def gibbs_mh_sweep_active_np(
             # carry-forward                                                      # <<< NEW
             ll_cur       = np.where(accept, ll_prop, ll_cur)
             lprior_cur_j = np.where(accept, lprior_prop_j_full, lprior_cur_j)
+            if run_trace is not None:
+                run_trace.add_submove_snapshot(
+                    move_type="rw_eigenline", slot_j=j, accepted_mask=accept,
+                    pt=pt_state, ps=ps_state
+                )
 
         # --- RW student-t ---
         if do_rw_student_t and (Ls is not None):
@@ -994,7 +1145,12 @@ def gibbs_mh_sweep_active_np(
 
             # carry-forward                                                      # <<< NEW
             ll_cur       = np.where(accept, ll_prop, ll_cur)
-            lprior_cur_j = np.where(accept, lprior_prop_j, lprior_cur_j)
+            lprior_cur_j = np.where(accept, lprior_prop_j_full, lprior_cur_j)
+            if run_trace is not None:
+                run_trace.add_submove_snapshot(
+                    move_type="rw_student_t", slot_j=j, accepted_mask=accept,
+                    pt=pt_state, ps=ps_state
+                )
 
         # --- DE two-point ---
         if do_de:
@@ -1037,11 +1193,21 @@ def gibbs_mh_sweep_active_np(
             ps_state.phi[:, :, j, :] = np.where(accept[:, :, None], prop[:, :, slot_sel], ps_state.phi[:, :, j, :])
             ll_cur       = np.where(accept, ll_prop, ll_cur)
             lprior_cur_j = np.where(accept, lprior_prop_j_full, lprior_cur_j)
+            if run_trace is not None:
+                run_trace.add_submove_snapshot(
+                    move_type="de", slot_j=j, accepted_mask=accept,
+                    pt=pt_state, ps=ps_state
+                )
 
     # PT swaps (even + odd), record attempts
     pt_state = PTState(thetas=thetas, log_probs=lps)
+    # even pass
     pt_state, acc_e, att_e = pt_swap_pass_numpy(rng, pt_state, betas, even_pass=True)
+    ps_swap_pass_inplace(ps_state, acc_e, even_pass=True)
+    # odd pass  
     pt_state, acc_o, att_o = pt_swap_pass_numpy(rng, pt_state, betas, even_pass=False)
+    ps_swap_pass_inplace(ps_state, acc_o, even_pass=False)
+
     C, W = pt_state.thetas.shape[:2]
     acc_pt = acc_e | acc_o
     att_pt = att_e | att_o
@@ -1051,12 +1217,19 @@ def gibbs_mh_sweep_active_np(
                 event_log.mh_events.append(
                     MHEvent(t_abs=t_abs, dt=dt, c=c, w=w, slot=-1, move_type="ptswap", accepted=bool(acc_pt[c, w]))
                 )
+    if run_trace is not None:
+        run_trace.add_submove_snapshot(
+            move_type="ptswap", slot_j=-1, accepted_mask=acc_pt,
+            pt=pt_state, ps=ps_state
+        )
     return pt_state
 
 
 # =============================================================================
 #                              Main CTMC + MH runner
 # =============================================================================
+
+from tqdm import tqdm
 
 def run_epoch_ct_numpy(
     *,
@@ -1095,7 +1268,8 @@ def run_epoch_ct_numpy(
     gamma_de: float = 2.38,
     # pseudo-prior sampler
     sample_pseudo_phi: Callable[[], np.ndarray],
-) -> Tuple[PTState, PSState, EventLog]:
+    trace_cfg: Optional["TraceConfig"] = None,
+) -> Tuple[PTState, PSState, EventLog, RunTrace]:
     """
     Hybrid CTMC:
      - Each (c,w) has its own BD clock λ_bd(c,w) derived from hazards.
@@ -1129,6 +1303,11 @@ def run_epoch_ct_numpy(
 
 
     events = EventLog(bd_events=[], mh_events=[])
+    tr = None ## saving all events
+    if trace_cfg is not None:
+        C, W, D = pt.thetas.shape
+        Kmax, d = ps.phi.shape[-2], ps.phi.shape[-1]
+        tr = RunTrace.init(trace_cfg, betas=betas, W=W, D=D, Kmax=Kmax, d=d)
 
     # initial BD clocks: sample from Exp(Λ(c,w))
     # compute hazards once to seed clocks
@@ -1147,154 +1326,180 @@ def run_epoch_ct_numpy(
     t = 0.0
     T_bd = T_bd + t
 
+    # N_ticks_est = int(rho_mh * T_end)
+    # with tqdm(total=N_ticks_est, desc="MH ticks") as pbar:
+
     # main loop
-    while t < T_end:
-        # next MH tick
-        tau_mh = rng.exponential(1.0 / rho_mh)
-        t_next = min(T_end, t + tau_mh)
+    with tqdm(total=T_end, desc="CT-MCMC run", unit="time") as pbar:
+        while t < T_end:
+            t_in = t
+            # next MH tick
+            tau_mh = rng.exponential(1.0 / rho_mh)
+            t_next = min(T_end, t + tau_mh)
 
-        # process BD events up to t_next in chronological order
-        while True:
-            # pick the nearest BD event in (absolute) time across all walkers (C, W)
-            idx_min = np.argmin(T_bd)  # flat index
-            c_min = int(idx_min // W)
-            w_min = int(idx_min %  W)
-            t_bd = T_bd[c_min, w_min]
-            if not np.isfinite(t_bd) or t_bd >= t_next:
-                break # no more BD events before next MH tick
+            # process BD events up to t_next in chronological order
+            # print ('debug: entering BD event processing loop')
+            cnt = 0
+            while True:
+                # pick the nearest BD event in (absolute) time across all walkers (C, W)
+                idx_min = np.argmin(T_bd)  # flat index
+                c_min = int(idx_min // W)
+                w_min = int(idx_min %  W)
+                t_bd = T_bd[c_min, w_min]
+                if not np.isfinite(t_bd) or t_bd >= t_next:
+                    break # no more BD events before next MH tick
 
-            # determine per-(c_min,w_min) hazards to sample a concrete slot event
-            # (We already have lam_on/off global, but they are stale if ps changed before; recompute for this chain.)
-            lam_on_cw, lam_off_cw, lam_total_cw = compute_bd_hazards_all(
-                PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
-                        ps.m[c_min:c_min+1, w_min:w_min+1],
-                        None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
-                        ps.logpi[c_min:c_min+1, w_min:w_min+1]),
-                betas[c_min:c_min+1],
-                qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
-                log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
-                log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),  # adapter
-                batched_loglik_masked=batched_ll_masked
-            )
-            lam_on_cw = lam_on_cw[0, 0]     # (Kmax,)
-            lam_off_cw = lam_off_cw[0, 0]   # (Kmax,)
-            hazards = np.concatenate([lam_on_cw, lam_off_cw])
-            total = hazards.sum()
-            if total <= 0.0 or not np.isfinite(total):
-                # no event; disable this clock
-                T_bd[c_min, w_min] = np.inf
-                continue
+                # determine per-(c_min,w_min) hazards to sample a concrete slot event
+                # (We already have lam_on/off global, but they are stale if ps changed before; recompute for this chain.)
+                lam_on_cw, lam_off_cw, lam_total_cw = compute_bd_hazards_all(
+                    PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
+                            ps.m[c_min:c_min+1, w_min:w_min+1],
+                            None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
+                            ps.logpi[c_min:c_min+1, w_min:w_min+1]),
+                    betas[c_min:c_min+1],
+                    qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+                    log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+                    log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),  # adapter
+                    batched_loglik_masked=batched_ll_masked
+                )
+                lam_on_cw = lam_on_cw[0, 0]     # (Kmax,)
+                lam_off_cw = lam_off_cw[0, 0]   # (Kmax,)
+                hazards = np.concatenate([lam_on_cw, lam_off_cw])
+                total = hazards.sum()
+                if total <= 0.0 or not np.isfinite(total):
+                    # no event; disable this clock
+                    T_bd[c_min, w_min] = np.inf
+                    continue
 
-            probs = hazards / total
-            idx = rng.choice(2 * Kmax, p=probs)
-            chosen_is_on = (idx < Kmax)
-            slot = idx if chosen_is_on else (idx - Kmax)
+                probs = hazards / total
+                idx = rng.choice(2 * Kmax, p=probs)
+                chosen_is_on = (idx < Kmax)
+                slot = idx if chosen_is_on else (idx - Kmax)
 
-            # apply BD toggle
-            phi_new = ps.phi.copy()
-            m_new   = ps.m.copy()
-            k_before = int(m_new[c_min, w_min].astype(np.int32).sum())
-            if chosen_is_on:   # birth
-                m_new[c_min, w_min, slot] = True
-            else:              # death
-                m_new[c_min, w_min, slot] = False
-                phi_new[c_min, w_min, slot, :] = sample_pseudo_phi()
+                # apply BD toggle
+                phi_new = ps.phi.copy()
+                m_new   = ps.m.copy()
+                k_before = int(m_new[c_min, w_min].astype(np.int32).sum())
+                if chosen_is_on:   # birth
+                    m_new[c_min, w_min, slot] = True
+                else:              # death
+                    m_new[c_min, w_min, slot] = False
+                    phi_new[c_min, w_min, slot, :] = sample_pseudo_phi()
 
-            # recompute current LL and logπ at (c_min,w_min)
-            # Get ll_cur for this modified state
-            phi_cw = phi_new[c_min, w_min][None, ...]   # (1,Kmax,d)
-            m_cw   = m_new[c_min, w_min][None, ...]     # (1,Kmax)
-            rest_cw = None if ps.rest is None else ps.rest[c_min, w_min][None, ...]
-            
-            ll_new = batched_ll_masked(phi_cw, m_cw, rest_cw)[0]
+                # recompute current LL and logπ at (c_min,w_min)
+                # Get ll_cur for this modified state
+                phi_cw = phi_new[c_min, w_min][None, ...]   # (1,Kmax,d)
+                m_cw   = m_new[c_min, w_min][None, ...]     # (1,Kmax)
+                rest_cw = None if ps.rest is None else ps.rest[c_min, w_min][None, ...]
+                
+                ll_new = batched_ll_masked(phi_cw, m_cw, rest_cw)[0]
 
-            # component & combinatorial terms
-            comp = 0.0
-            for i in range(Kmax):
-                if m_new[c_min, w_min, i]:
-                    comp += float(log_prior_phi_np(phi_new[c_min, w_min, i]))
+                # component & combinatorial terms
+                comp = 0.0
+                for i in range(Kmax):
+                    if m_new[c_min, w_min, i]:
+                        comp += float(log_prior_phi_np(phi_new[c_min, w_min, i]))
+                    else:
+                        comp += float(log_pseudo_phi_np(phi_new[c_min, w_min, i]))
+                k_cur = int(m_new[c_min, w_min].astype(np.int32).sum())
+                comb = float(log_p_k_np(np.array([[k_cur]])).reshape(())) \
+                    + float(_log_uniform_masks_given_k(Kmax, np.array(k_cur))) \
+                    + float(_log_symmetrization(np.array(k_cur)))
+                logpi_cw = comb + comp + float(betas[c_min] * ll_new)
+
+                ps = PSState(phi=phi_new, m=m_new, rest=ps.rest, logpi=ps.logpi.copy())
+                ps.logpi[c_min, w_min] = logpi_cw
+
+                # Keep PT and PS consistent right after BD
+                pt.log_probs[c_min, w_min] = ll_new
+
+                # Also sync PT θ for the affected slot so proposals start from PS state
+                sl = slot_slices[slot]                   # slice/mask in θ-space for this φ_slot
+                pt.thetas[c_min, w_min, sl] = phi_new[c_min, w_min, slot, :]
+
+                # log event
+                ev = BDEvent(
+                    t_abs=t_bd,
+                    dt=t_bd - t,
+                    kind=(0 if chosen_is_on else 1),
+                    c=c_min, w=w_min,
+                    slot=int(slot),
+                    k_before=k_before,
+                    k_after=int(m_new[c_min, w_min].astype(np.int32).sum())
+                )
+                events.bd_events.append(ev)
+                if tr is not None:
+                    tr.add_bd_event(ev, ps, with_snapshot=True)
+
+                # advance "now" to this BD time for subsequent events
+                t = t_bd
+
+                # redraw this chain's next absolute BD time from its new Λ(c,w)
+                lam_on, lam_off, lam_total_single = compute_bd_hazards_all(
+                    PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
+                            ps.m[c_min:c_min+1, w_min:w_min+1],
+                            None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
+                            ps.logpi[c_min:c_min+1, w_min:w_min+1]),
+                    betas[c_min:c_min+1],
+                    qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+                    log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+                    log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),
+                    batched_loglik_masked=batched_ll_masked
+                )
+                lam_next = lam_total_single[0, 0]
+                if lam_next > 0.0 and np.isfinite(lam_next):
+                    T_bd[c_min, w_min] = t + rng.exponential(1.0 / lam_next)
                 else:
-                    comp += float(log_pseudo_phi_np(phi_new[c_min, w_min, i]))
-            k_cur = int(m_new[c_min, w_min].astype(np.int32).sum())
-            comb = float(log_p_k_np(np.array([[k_cur]])).reshape(())) \
-                   + float(_log_uniform_masks_given_k(Kmax, np.array(k_cur))) \
-                   + float(_log_symmetrization(np.array(k_cur)))
-            logpi_cw = comb + comp + float(betas[c_min] * ll_new)
+                    T_bd[c_min, w_min] = np.inf
+                cnt += 1
+            # print ('debug cnt =', cnt)
 
-            ps = PSState(phi=phi_new, m=m_new, rest=ps.rest, logpi=ps.logpi.copy())
-            ps.logpi[c_min, w_min] = logpi_cw
+            if tr is not None:
+                tr.begin_mh_tick(t_abs=t_next, dt=(t_next - t))
 
-            # log event
-            ev = BDEvent(
-                t_abs=t_bd,
-                dt=t_bd - t,
-                kind=(0 if chosen_is_on else 1),
-                c=c_min, w=w_min,
-                slot=int(slot),
-                k_before=k_before,
-                k_after=int(m_new[c_min, w_min].astype(np.int32).sum())
+            # Perform MH sweep at t_next
+            pt = gibbs_mh_sweep_active_np(
+                rng,
+                t_abs=t_next, dt=(t_next - t),
+                pt_state=pt, ps_state=ps, slot_slices=slot_slices,
+                betas=betas,
+                batched_loglik_masked=batched_ll_masked,
+                log_prior_phi_np=log_prior_phi_np,
+                Ls=Ls, U=U, S=S,
+                do_stretch=do_stretch,
+                do_rw_fullcov=do_rw_fullcov,
+                do_rw_eigenline=do_rw_eigenline,
+                do_rw_student_t=do_rw_student_t,
+                do_de=do_de,
+                stretch_a=stretch_a,
+                cross_rate=cross_rate,
+                gamma_de=gamma_de,
+                event_log=events,
+                run_trace=tr,
             )
-            events.bd_events.append(ev)
 
-            # advance "now" to this BD time for subsequent events
-            t = t_bd
-
-            # redraw this chain's next absolute BD time from its new Λ(c,w)
-            lam_on, lam_off, lam_total_single = compute_bd_hazards_all(
-                PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
-                        ps.m[c_min:c_min+1, w_min:w_min+1],
-                        None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
-                        ps.logpi[c_min:c_min+1, w_min:w_min+1]),
-                betas[c_min:c_min+1],
+            # reset all BD clocks after MH (memoryless, and hazards may change via θ)
+            lam_on, lam_off, lam_total = compute_bd_hazards_all(
+                ps, betas,
                 qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
                 log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
-                log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),
+                log_p_k_np=log_p_k_np,
                 batched_loglik_masked=batched_ll_masked
             )
-            lam_next = lam_total_single[0, 0]
-            if lam_next > 0.0 and np.isfinite(lam_next):
-                T_bd[c_min, w_min] = t + rng.exponential(1.0 / lam_next)
-            else:
-                T_bd[c_min, w_min] = np.inf
+            T_bd[:] = np.inf
+            with np.errstate(divide='ignore'):
+                mask_pos = lam_total > 0.0
+                T_bd[mask_pos] = rng.exponential(1.0 / lam_total[mask_pos])
+            T_bd += t_next
 
-        # Perform MH sweep at t_next
-        pt = gibbs_mh_sweep_active_np(
-            rng,
-            t_abs=t_next, dt=(t_next - t),
-            pt_state=pt, ps_state=ps, slot_slices=slot_slices,
-            betas=betas,
-            batched_loglik_masked=batched_ll_masked,
-            log_prior_phi_np=log_prior_phi_np,
-            Ls=Ls, U=U, S=S,
-            do_stretch=do_stretch,
-            do_rw_fullcov=do_rw_fullcov,
-            do_rw_eigenline=do_rw_eigenline,
-            do_rw_student_t=do_rw_student_t,
-            do_de=do_de,
-            stretch_a=stretch_a,
-            cross_rate=cross_rate,
-            gamma_de=gamma_de,
-            event_log=events,
-        )
+            # advance to MH time
+            t = t_next
+            dt_advance = t - t_in
+            pbar.update(dt_advance)
+            # pbar.n = t                                   # set absolute progress
+            # pbar.refresh()
 
-        # reset all BD clocks after MH (memoryless, and hazards may change via θ)
-        lam_on, lam_off, lam_total = compute_bd_hazards_all(
-            ps, betas,
-            qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
-            log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
-            log_p_k_np=log_p_k_np,
-            batched_loglik_masked=batched_ll_masked
-        )
-        T_bd[:] = np.inf
-        with np.errstate(divide='ignore'):
-            mask_pos = lam_total > 0.0
-            T_bd[mask_pos] = rng.exponential(1.0 / lam_total[mask_pos])
-        T_bd += t_next
-
-        # advance to MH time
-        t = t_next
-
-    return pt, ps, events
+    return pt, ps, events, tr
 
 
 

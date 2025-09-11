@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Callable, Literal, Tuple, Dict
+from typing import Callable, Literal, Optional, Tuple, Dict, List
 
 import jax
 import jax.numpy as jnp
@@ -160,6 +160,127 @@ class EventLog:
         i = self.current_index
         return EventLog(self.kind[:i], self.dt[:i], self.c[:i], self.w[:i], self.j[:i], int(i), int(i))
 
+
+### Defines which temperatures I want to trace (save) and how often
+@dataclass
+class TraceConfig:
+    # temperatures to record; if None -> default to argmax(beta) (cold chain)
+    chain_inds: Optional[List[int]] = None
+    # record after every N MH sweeps (NOT submoves) — you already log submoves in PTTrace
+    record_every: int = 1
+    # cap sizes for ring buffers
+    max_pt_events: int = 10000
+    max_ps_events: int = 10000
+    max_events: int   = 10000
+
+def _resolve_chain_inds(betas: np.ndarray, cfg: TraceConfig) -> List[int]:
+    if cfg.chain_inds is not None and len(cfg.chain_inds) > 0:
+        return list(cfg.chain_inds)
+    return [int(np.argmax(betas))]
+
+
+## bundle all tracers together
+@dataclass
+class TraceConfig:
+    # temperatures to record; if None -> default to argmax(beta) (cold chain)
+    chain_inds: Optional[List[int]] = None
+    # record after every N MH sweeps (NOT submoves) — you already log submoves in PTTrace
+    record_every: int = 1
+    # cap sizes for ring buffers
+    max_pt_events: int = 10000
+    max_ps_events: int = 10000
+    max_events: int   = 10000
+
+def _resolve_chain_inds(betas: np.ndarray, cfg: TraceConfig) -> List[int]:
+    if cfg.chain_inds is not None and len(cfg.chain_inds) > 0:
+        return list(cfg.chain_inds)
+    return [int(np.argmax(betas))]
+
+
+class TraceManager:
+    def __init__(self, *, C:int, W:int, D:int, Kmax:int, d:int,
+                 betas: np.ndarray, cfg: TraceConfig,
+                 dtype=jnp.float32, mdtype=jnp.bool_):
+        self.cfg = cfg
+        self.chain_inds = _resolve_chain_inds(betas, cfg)
+
+        # full-state buffers (per-event)
+        self.pt = PTTrace.init(cfg.max_pt_events, C, W, D, dtype=dtype)
+        self.ps = PSTrace.init(cfg.max_ps_events, C, W, Kmax, d, dtype=dtype, mdtype=mdtype)
+        self.ev = EventLog.init(cfg.max_events)
+
+        # optional per-sweep snapshots of selected chains
+        self._snap_theta = []
+        self._snap_phi   = []
+        self._snap_m     = []
+        self._snap_ll    = []
+        self._snap_t     = []
+
+        self._mh_tick = 0
+
+    # You already log PT submoves via PTTrace.append_always(...) where you make the move.
+    def record_pt_submove(self, st: PTState, accepted_mask, prop_id: int, slot_j: int):
+        self.pt = self.pt.append_always(st, accepted_mask, prop_id, slot_j)
+
+    def record_bd_event(self, ps_state: PSState, dt: float, c:int, w:int, j:int, kind:int):
+        # PSTrace: snapshot after every BD (always accepted)
+        self.ps = self.ps.append(ps_state)
+        # EventLog: kind 0/1 for birth/death (you already do this)
+        self.ev = self.ev.append(kind=kind, dt=dt, c=c, w=w, j=j)
+
+    def record_mh_tick(self, dt: float):
+        # EventLog: kind 2 for MH tick (no c,w,j)
+        self.ev = self.ev.append(kind=2, dt=dt, c=-1, w=-1, j=-1)
+        self._mh_tick += 1
+
+    # Optional: store compact snapshots of selected temperature chains after a sweep
+    def snapshot_selected_chains(self, pt_state: PTState, ps_state: PSState, t_abs: float):
+        if (self._mh_tick % self.cfg.record_every) != 0:
+            return
+        ci = self.chain_inds
+        self._snap_theta.append(pt_state.thetas[ci].copy())  # (Nc,W,D)
+        self._snap_phi.append(  ps_state.phi[ci].copy())     # (Nc,W,Kmax,d)
+        self._snap_m.append(    ps_state.m[ci].copy())       # (Nc,W,Kmax)
+        self._snap_ll.append(   pt_state.log_probs[ci].copy())# (Nc,W)
+        self._snap_t.append(float(t_abs))
+
+    def export(self) -> Dict[str, np.ndarray]:
+        # stack optional snapshots; keep None if empty
+        def _stack(xs): return None if len(xs)==0 else np.stack(xs, axis=0)
+        return {
+            "snapshot_theta": _stack(self._snap_theta),   # (Trec,Nc,W,D)
+            "snapshot_phi":   _stack(self._snap_phi),     # (Trec,Nc,W,Kmax,d)
+            "snapshot_m":     _stack(self._snap_m),       # (Trec,Nc,W,Kmax)
+            "snapshot_ll":    _stack(self._snap_ll),      # (Trec,Nc,W)
+            "snapshot_t":     (None if len(self._snap_t)==0 else np.asarray(self._snap_t)),
+            "chain_inds":     np.asarray(self.chain_inds, dtype=np.int32),
+        }
+
+    def bundle(self) -> Traces:
+        return Traces(self.pt, self.ps, self.ev, self.chain_inds)
+
+    def finalize(self) -> Dict[str, np.ndarray]:
+        tb = self.bundle().finalize()
+        out = {
+            "pt_thetas":     np.array(tb.pt.thetas),
+            "pt_log_probs":  np.array(tb.pt.log_probs),
+            "pt_accepted":   np.array(tb.pt.accepted),
+            "pt_prop_id":    np.array(tb.pt.prop_id),
+            "pt_slot_j":     np.array(tb.pt.slot_j),
+
+            "ps_phi":        np.array(tb.ps.phi),
+            "ps_m":          np.array(tb.ps.m),
+            "ps_logpi":      np.array(tb.ps.logpi),
+
+            "ev_kind":       np.array(tb.ev.kind),
+            "ev_dt":         np.array(tb.ev.dt),
+            "ev_c":          np.array(tb.ev.c),
+            "ev_w":          np.array(tb.ev.w),
+            "ev_j":          np.array(tb.ev.j),
+            "chain_inds":    np.asarray(self.chain_inds, dtype=np.int32),
+        }
+        out.update(self.export())
+        return out
 
 # ==============================
 #     Target & Likelihood
