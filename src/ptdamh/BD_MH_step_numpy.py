@@ -599,6 +599,10 @@ def masked_ll_for_phi_batch(
     return np.asarray(ll, dtype=np.float64)
 
 
+def _logsigmoid(x):
+    # -softplus(-x)
+    return -np.log1p(np.exp(-np.clip(x, -700, 700)))
+
 # =============================================================================
 #     Vectorized hazards for ALL chains via one batched LL call (NumPy+JAX)
 # =============================================================================
@@ -643,7 +647,7 @@ def compute_bd_hazards_all(
     ll_cur = batched_loglik_masked(phi_cur, m_cur, rest_cur)     # (B,)
     ll_cur = ll_cur.reshape(C, W)
 
-    # ----- Build "turn off i" batches -----
+    # ----- Build "turn OFF i" batches -----
     # For each (c,w), we create Kmax masks with exactly index i turned off.
     # Note: this is vectorized across B*Kmax in one call.
     m_off = np.repeat(m_cur[:, None, :], Kmax, axis=1)           # (B,Kmax,Kmax)
@@ -659,6 +663,19 @@ def compute_bd_hazards_all(
 
     ll_off_flat = batched_loglik_masked(phi_off_flat, m_off_flat, rest_off_flat)  # (B*Kmax,)
     ll_off = ll_off_flat.reshape(C, W, Kmax)                                      # (C,W,Kmax)
+
+    # --- build "turn ON j" batches (mirror of OFF) ---
+    m_on = np.repeat(m_cur[:, None, :], Kmax, axis=1)                   # (B,Kmax,Kmax)
+    arK  = np.arange(Kmax)
+    m_on[np.arange(B)[:, None], arK[None, :], arK[None, :]] = True
+    phi_on  = np.repeat(phi_cur[:, None, :, :], Kmax, axis=1)           # (B,Kmax,Kmax,d)
+    rest_on = None if rest_cur is None else np.repeat(rest_cur[:, None, :], Kmax, axis=1)
+
+    phi_on_flat  = phi_on.reshape(B*Kmax, Kmax, d)
+    m_on_flat    = m_on.reshape(B*Kmax, Kmax)
+    rest_on_flat = None if rest_on is None else rest_on.reshape(B*Kmax, -1)
+    ll_on_flat   = batched_loglik_masked(phi_on_flat, m_on_flat, rest_on_flat)  # (B*Kmax,)
+    ll_on        = ll_on_flat.reshape(C, W, Kmax)                                # (C,W,Kmax)
 
     # ----- Static prior/pseudoprior + k-terms for current and off -----
     # component terms for current mask
@@ -698,10 +715,34 @@ def compute_bd_hazards_all(
     comb_cur_b = np.repeat(comb_cur[:, :, None], Kmax, axis=2)
     delta_comb_off = (comb_off_b - comb_cur_b) * act                               # (C,W,Kmax)
 
+
+    delta_unscaled_off = delta_comp_off + delta_comb_off
+    delta_comp_on  = (logp - logpsi) * (~m)                                      # sign flip vs OFF
+    k_on           = np.clip(k_cur + 1, 0, Kmax)
+    comb_on        = log_p_k_np(k_on) + _log_uniform_masks_given_k(Kmax, k_on) + _log_symmetrization(k_on)
+    delta_comb_on  = (np.repeat(comb_on[:, :, None], Kmax, axis=2)
+                    - np.repeat(comb_cur[:, :, None], Kmax, axis=2)) * (~m)
+    delta_unscaled_on = delta_comp_on + delta_comb_on
+
+    beta_cw = betas[:, None]                     # (C,1)
+
+    Delta_off = delta_unscaled_off + beta_cw[:, :, None] * (ll_off - ll_cur[:, :, None])
+    Delta_on  = delta_unscaled_on  + beta_cw[:, :, None] * (ll_on  - ll_cur[:, :, None])
+
+    # --- Barker/logistic hazards in log-space ---
+    if bd_rate_scale > 0.0:
+        log_base = (np.log(bd_rate_scale)
+                    + np.log(np.maximum(betas[:, None], 1e-300)))      # (C,1)
+    else:
+        log_base = -np.inf * np.ones((C, 1))
+
+
+    
+
       # Δ untempered part when turning i off:
-    delta_unscaled_off = delta_comp_off + delta_comb_off                          # (C,W,Kmax)
-    # log ratio: log π_off - log π_cur = Δunscaled_off + β * (ll_off - ll_cur)
-    log_ratio_off = delta_unscaled_off + beta_cw[:, :, None] * (ll_off - ll_cur[:, :, None])  # (C,W,Kmax)
+    # delta_unscaled_off = delta_comp_off + delta_comb_off                          # (C,W,Kmax)
+    # # log ratio: log π_off - log π_cur = Δunscaled_off + β * (ll_off - ll_cur)
+    # log_ratio_off = delta_unscaled_off + beta_cw[:, :, None] * (ll_off - ll_cur[:, :, None])  # (C,W,Kmax)
 
     # # full logπ_off (tempered) for each i:
     # logpi_off = (logpi_unscaled_cur[:, :, None] + delta_comp_off + delta_comb_off) \
@@ -731,31 +772,76 @@ def compute_bd_hazards_all(
     #     lam_on[:, :, j] = np.where(~m[:, :, j], betas[:, None] * np.maximum(0.0, val), 0.0)
 
     # On-hazards, per slot j in log
-    for j in range(Kmax):
-        if qb_eval_variant == "child":
-            ctx = m.copy(); ctx[:, :, j] = True
-        else:
-            ctx = m
-        val = qb_density_np(phi[:, :, j, :], ctx, phi, ps.rest)     # (C,W)
-        log_q = _log_pos(val) + log_bd_scale                        # <<< NEW
-        # only where currently inactive
-        log_lam_on[:, :, j] = np.where(~m[:, :, j], (log_beta + log_q), -np.inf)
+    # for j in range(Kmax):
+    #     if qb_eval_variant == "child":
+    #         ctx = m.copy(); ctx[:, :, j] = True
+    #     else:
+    #         ctx = m
+    #     val = qb_density_np(phi[:, :, j, :], ctx, phi, ps.rest)     # (C,W)
+    #     log_q = _log_pos(val) + log_bd_scale                        # <<< NEW
+    #     # only where currently inactive
+    #     log_lam_on[:, :, j] = np.where(~m[:, :, j], (log_beta + log_q), -np.inf)
 
-  
-    # Off-hazards, per slot i in log
-    for i in range(Kmax):
+    # ---------- ON hazards (flip j: inactive -> active) ----------
+    for j in range(Kmax):
+        # q_fwd for ON: x (m_j=False) -> x' (m'_j=True)
         if qb_eval_variant == "child":
-            ctx = m
-        else:
-            ctx = m.copy(); ctx[:, :, i] = False
-        val = qb_density_np(phi[:, :, i, :], ctx, phi, ps.rest)     # (C,W)
-        log_q = _log_pos(val) + log_bd_scale                        # <<< NEW
-        log_lam_off[:, :, i] = np.where(
-            m[:, :, i],
-            (log_beta + log_q) + log_ratio_off[:, :, i],
+            # child = destination of forward (evaluate in proposed ON context)
+            ctx_fwd = m.copy(); ctx_fwd[:, :, j] = True
+        else:  # "parent"
+            # parent = origin of forward (evaluate in current context)
+            ctx_fwd = m
+        q_fwd = qb_density_np(phi[:, :, j, :], ctx_fwd, phi, ps.rest)
+        log_q_fwd = _log_pos(q_fwd) + log_bd_scale
+
+        # q_rev for reverse OFF at x' (x' -> x)
+        if qb_eval_variant == "child":
+            # child = destination of reverse (evaluate in OFF context)
+            ctx_rev = m.copy(); ctx_rev[:, :, j] = False
+        else:  # "parent"
+            # parent = origin of reverse (at x', j is active)
+            ctx_rev = m.copy(); ctx_rev[:, :, j] = True
+        q_rev = qb_density_np(phi[:, :, j, :], ctx_rev, phi, ps.rest)
+        log_q_rev = _log_pos(q_rev) + log_bd_scale
+
+        # Barker/logistic with full MH log-ratio
+        Delta_on_tilde = Delta_on[:, :, j] + (log_q_rev - log_q_fwd)
+
+        log_lam_on[:, :, j] = np.where(
+            ~m[:, :, j],
+            log_beta + log_q_fwd + _logsigmoid(Delta_on_tilde),
             -np.inf
         )
 
+    # ---------- OFF hazards (flip i: active -> inactive) ----------
+    for i in range(Kmax):
+        # q_fwd for OFF: x (m_i=True) -> x' (m'_i=False)
+        if qb_eval_variant == "child":
+            # child = destination of forward (evaluate in proposed OFF context)
+            ctx_fwd = m.copy(); ctx_fwd[:, :, i] = False
+        else:  # "parent"
+            # parent = origin of forward (evaluate in current context)
+            ctx_fwd = m
+        q_fwd = qb_density_np(phi[:, :, i, :], ctx_fwd, phi, ps.rest)
+        log_q_fwd = _log_pos(q_fwd) + log_bd_scale
+
+        # q_rev for reverse ON at x' (x' -> x)
+        if qb_eval_variant == "child":
+            # child = destination of reverse (evaluate in ON context)
+            ctx_rev = m.copy(); ctx_rev[:, :, i] = True
+        else:  # "parent"
+            # parent = origin of reverse (at x', i is inactive)
+            ctx_rev = m.copy(); ctx_rev[:, :, i] = False
+        q_rev = qb_density_np(phi[:, :, i, :], ctx_rev, phi, ps.rest)
+        log_q_rev = _log_pos(q_rev) + log_bd_scale
+
+        Delta_off_tilde = Delta_off[:, :, i] + (log_q_rev - log_q_fwd)
+
+        log_lam_off[:, :, i] = np.where(
+            m[:, :, i],
+            log_beta + log_q_fwd + _logsigmoid(Delta_off_tilde),
+            -np.inf
+        )
 
     # for i in range(Kmax):
     #     if qb_eval_variant == "child":
@@ -770,6 +856,10 @@ def compute_bd_hazards_all(
     #         0.0
     #     )
 
+    # slots that are currently active must have ON = -inf
+    assert not np.any(np.isfinite(log_lam_on[m])),  "ON hazard finite where active"
+    # slots that are currently inactive must have OFF = -inf
+    assert not np.any(np.isfinite(log_lam_off[~m])), "OFF hazard finite where inactive"
     # Total rate for waiting-time (linear), but sum via logsumexp
     log_lam_all = np.concatenate([log_lam_on, log_lam_off], axis=2) # (C,W,2K)
     # stable log-sum-exp along last axis
@@ -1329,6 +1419,8 @@ _DB_TOL = 1e-2              # |lhs - rhs| tolerance for detailed balance    # ##
 _EPS = 1e-300               # log-safe epsilon for hazards                  # ### ADDED
 _LL_HARD_MIN = -1e12        # flag very bad LL                               # ### ADDED
 
+DO_PSEUDO_REFRESH = True  # set True to enable
+
 def run_epoch_ct_numpy(
     *,
     # RNG seed
@@ -1413,6 +1505,10 @@ def run_epoch_ct_numpy(
 
     # initial BD clocks: sample from Exp(Λ(c,w))
     # compute hazards once to seed clocks
+    if DO_PSEUDO_REFRESH:
+        idxs = np.argwhere(~ps.m)  # (n_inactive, 3) over (c,w,slot)
+        for c_i, w_i, j_i in idxs:
+            ps.phi[c_i, w_i, j_i, :] = sample_pseudo_phi()
     _, _, lam_total, _ = compute_bd_hazards_all(
         ps, betas,
         qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
@@ -1432,7 +1528,7 @@ def run_epoch_ct_numpy(
     # with tqdm(total=N_ticks_est, desc="MH ticks") as pbar:
 
     # main loop
-    with tqdm(total=T_end, desc="CT-MCMC run", unit="time") as pbar:
+    with tqdm(total=T_end, desc="CT-MCMC run", unit="time") as pbar:   
         while t < T_end:
             t_in = t
             # next MH tick
@@ -1466,6 +1562,8 @@ def run_epoch_ct_numpy(
                     #     log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),  # adapter
                     #     batched_loglik_masked=batched_ll_masked
                     # )
+                    
+
                     log_lam_on_cw, log_lam_off_cw, _, _ = compute_bd_hazards_all(           # <<< CHANGED
                         PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
                                 ps.m[c_min:c_min+1,   w_min:w_min+1],
@@ -1567,7 +1665,7 @@ def run_epoch_ct_numpy(
                         m_new[c_min, w_min, slot] = True
                     else:              # death
                         m_new[c_min, w_min, slot] = False
-                        phi_new[c_min, w_min, slot, :] = sample_pseudo_phi()
+                        # phi_new[c_min, w_min, slot, :] = sample_pseudo_phi()
 
                     # recompute current LL and logπ at (c_min,w_min)
                     # Get ll_cur for this modified state
@@ -1618,8 +1716,6 @@ def run_epoch_ct_numpy(
                         log_lam_on_new  = log_lam_on_new[0, 0]                                    # <<< CHANGED
                         log_lam_off_new = log_lam_off_new[0, 0]                                   # <<< CHANGED
 
-                        log_lam_rev = float(log_lam_off_new[slot] if chosen_is_on                # <<< CHANGED
-                                            else log_lam_on_new[slot])
                         log_lam_rev = float(log_lam_off_new[slot] if chosen_is_on else log_lam_on_new[slot])
                         if log_lam_rev < -800:
                             print(f"[BD REV-FLOOR] c={c_min} w={w_min} slot={slot} logλ_rev={log_lam_rev:.1f} "
@@ -1668,6 +1764,14 @@ def run_epoch_ct_numpy(
 
                     # advance "now" to this BD time for subsequent events
                     t = t_bd
+                    if DO_PSEUDO_REFRESH and (not chosen_is_on):           # we just did a death
+                        old_phi = ps.phi[c_min, w_min, slot, :].copy()
+                        new_phi = sample_pseudo_phi()
+                        ps.phi[c_min, w_min, slot, :] = new_phi
+                        # keep cached tempered logπ consistent (optional)
+                        ps.logpi[c_min, w_min] += (
+                            log_pseudo_phi_np(new_phi) - log_pseudo_phi_np(old_phi)
+                        )
 
                     # redraw this chain's next absolute BD time from its new Λ(c,w)
                     _, _, lam_total_single, _ = compute_bd_hazards_all(
@@ -1723,6 +1827,12 @@ def run_epoch_ct_numpy(
             #     batched_loglik_masked=batched_ll_masked
             # )
             if DO_BD:
+
+                if DO_PSEUDO_REFRESH:
+                    idxs = np.argwhere(~ps.m)  # (n_inactive, 3) over (c,w,slot)
+                    for c_i, w_i, j_i in idxs:
+                        ps.phi[c_i, w_i, j_i, :] = sample_pseudo_phi()
+                
                 _, _, lam_total, _ = compute_bd_hazards_all(
                     ps, betas,
                     qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
