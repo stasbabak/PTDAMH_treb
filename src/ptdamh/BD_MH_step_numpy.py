@@ -356,6 +356,7 @@ def propose_rw_eigenline_slot_np(
     S: np.ndarray,            # (C,D)   eigenvalues
     slot_sel,
 ) -> np.ndarray:
+    
     C, W, D = X.shape
     out = X.copy()
     if isinstance(slot_sel, slice):
@@ -371,16 +372,20 @@ def propose_rw_eigenline_slot_np(
     axes = idx[axes_local]  # map to global D indices (C,W)
 
     # gather eigenvector column at that axis, but zero outside the slot
-    U_ax = np.zeros((C, W, D), dtype=X.dtype)
+    # U_ax = np.zeros((C, W, D), dtype=X.dtype)
+    r = rng.standard_normal(size=(C, W))
     for c in range(C):
-        U_ax[c, :, idx] = U[c][:, axes[c]]  # copy the chosen eigenvector’s components
+        U_slot = np.zeros((W, d_slot), dtype=X.dtype)
+        # gather per-(w) axis components for this c
+        u_cols = U[c][idx, axes[c]]     # shape (d_slot, W)
+        U_slot[:, :] = u_cols.T         # to (W, d_slot)
+        # U_ax[c, :, idx] = U[c][:, axes[c]]  # copy the chosen eigenvector’s components
         # zero outside slot automatically since we only wrote idx slice
 
-    # step size from eigenvalue at that axis
-    S_ax = S[np.arange(C)[:, None], axes]   # (C,W)
-    r = rng.standard_normal(size=(C, W))
-    step = (r * np.sqrt(S_ax))[..., None] * U_ax
-    out = X + step
+        S_ax = S[c, axes[c]]            # (W,)
+        step_slot = (r[c] * np.sqrt(S_ax))[:, None] * U_slot  # (W, d_slot)
+        out[c, :, idx] = X[c, :, idx] + step_slot
+
     return out
 
 
@@ -577,15 +582,6 @@ def make_batched_loglik_masked(log_lik_masked_jax: Callable[[jnp.ndarray, jnp.nd
     return batched
 
 
-# def _slot_prior_np(mat_cwd: np.ndarray, log_prior_phi_np) -> np.ndarray:
-#     # mat_cwd: (C,W,d) -> (C,W)
-#     # vectorized call to per-slot prior
-#     C, W, D = mat_cwd.shape
-#     out = np.empty((C, W), dtype=np.float64)
-#     for c in range(C):
-#         for w in range(W):
-#             out[c, w] = float(log_prior_phi_np(mat_cwd[c, w]))
-#     return out
 
 def masked_ll_for_phi_batch(
     phi: np.ndarray,   # (C,W,Kmax,d)
@@ -618,7 +614,7 @@ def compute_bd_hazards_all(
     log_p_k_np: Callable[[np.ndarray], np.ndarray],  # vectorized over k (B,)
     batched_loglik_masked: Callable[[np.ndarray, np.ndarray, Optional[np.ndarray]], np.ndarray],
     bd_rate_scale = 1.0, 
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute hazards (lam_on, lam_off, lam_total) for ALL (c,w) in one shot.
 
@@ -626,11 +622,18 @@ def compute_bd_hazards_all(
       lam_on:  (C,W,Kmax)
       lam_off: (C,W,Kmax)
       lam_total: (C,W)
+      log_lam_total: (C,W)
     """
     phi, m, rest, logpi_cur = ps.phi, ps.m, ps.rest, ps.logpi
     C, W, Kmax, d = phi.shape
     B = C * W
     beta_cw = betas[:, None]                   # (C,1)
+    log_beta = np.log(np.clip(beta_cw, 1e-300, None))               # <<< NEW
+
+    def _log_pos(x):                                                # <<< NEW
+        return np.where(x > 0.0, np.log(x), -np.inf)
+
+    log_bd_scale = np.log(max(bd_rate_scale, 1e-300))               # <<< NEW
 
     # ----- Build current-mask batch to compute current LL -----
     phi_cur = phi.reshape(B, Kmax, d)          # (B,Kmax,d)
@@ -673,7 +676,8 @@ def compute_bd_hazards_all(
     comb_cur = log_p_k_np(k_cur) + _log_uniform_masks_given_k(Kmax, k_cur) + _log_symmetrization(k_cur)  # (C,W)
 
     logpi_unscaled_cur = comb_cur + comp_cur                                       # (C,W)
-    logpi_tempered_cur = logpi_unscaled_cur + beta_cw * ll_cur                     # (C,W)
+
+    # logpi_tempered_cur = logpi_unscaled_cur + beta_cw * ll_cur                     # (C,W)
 
     # For off masks: only i-th site flips active->inactive; others unchanged.
     # We can construct the *difference* of the unscaled part quickly:
@@ -694,6 +698,11 @@ def compute_bd_hazards_all(
     comb_cur_b = np.repeat(comb_cur[:, :, None], Kmax, axis=2)
     delta_comb_off = (comb_off_b - comb_cur_b) * act                               # (C,W,Kmax)
 
+      # Δ untempered part when turning i off:
+    delta_unscaled_off = delta_comp_off + delta_comb_off                          # (C,W,Kmax)
+    # log ratio: log π_off - log π_cur = Δunscaled_off + β * (ll_off - ll_cur)
+    log_ratio_off = delta_unscaled_off + beta_cw[:, :, None] * (ll_off - ll_cur[:, :, None])  # (C,W,Kmax)
+
     # # full logπ_off (tempered) for each i:
     # logpi_off = (logpi_unscaled_cur[:, :, None] + delta_comp_off + delta_comb_off) \
     #             + beta_cw[:, :, None] * (ll_off - ll_cur[:, :, None])             # (C,W,Kmax)
@@ -701,45 +710,80 @@ def compute_bd_hazards_all(
     # ----- Hazards -----
     # On: for j with m=0, λ_on = β * q_b(φ_j | ctx), where ctx is parent or child-evaluated.
     # Off: for i with m=1, λ_off = β * q_b(φ_i | ctx) * exp(logπ_off(i) - logπ_cur)
-    lam_on = np.zeros((C, W, Kmax), dtype=np.float64)
-    lam_off = np.zeros((C, W, Kmax), dtype=np.float64)
+    # lam_on = np.zeros((C, W, Kmax), dtype=np.float64)
+    # lam_off = np.zeros((C, W, Kmax), dtype=np.float64)
+
+     # ---------------------------- log hazards ----------------------------
+    log_lam_on  = np.full((C, W, Kmax), -np.inf, dtype=np.float64)  # <<< CHANGED
+    log_lam_off = np.full((C, W, Kmax), -np.inf, dtype=np.float64)  # <<< CHANGED
 
     # evaluate qb on needed contexts
+    # for j in range(Kmax):
+    #     # build ctx for child/parent
+    #     if qb_eval_variant == "child":
+    #         ctx = m.copy()
+    #         ctx[:, :, j] = True
+    #     else:
+    #         ctx = m
+    #     # density per (c,w)
+    #     # qb_density_np takes (phi_j:(C,W,d), m_ctx:(C,W,Kmax), phi_all:(C,W,Kmax,d), rest:(C,W,Drest) or None)
+    #     val = bd_rate_scale*qb_density_np(phi[:, :, j, :], ctx, phi, ps.rest)  # (C,W)
+    #     lam_on[:, :, j] = np.where(~m[:, :, j], betas[:, None] * np.maximum(0.0, val), 0.0)
+
+    # On-hazards, per slot j in log
     for j in range(Kmax):
-        # build ctx for child/parent
         if qb_eval_variant == "child":
-            ctx = m.copy()
-            ctx[:, :, j] = True
+            ctx = m.copy(); ctx[:, :, j] = True
         else:
             ctx = m
-        # density per (c,w)
-        # qb_density_np takes (phi_j:(C,W,d), m_ctx:(C,W,Kmax), phi_all:(C,W,Kmax,d), rest:(C,W,Drest) or None)
-        val = bd_rate_scale*qb_density_np(phi[:, :, j, :], ctx, phi, ps.rest)  # (C,W)
-        lam_on[:, :, j] = np.where(~m[:, :, j], betas[:, None] * np.maximum(0.0, val), 0.0)
+        val = qb_density_np(phi[:, :, j, :], ctx, phi, ps.rest)     # (C,W)
+        log_q = _log_pos(val) + log_bd_scale                        # <<< NEW
+        # only where currently inactive
+        log_lam_on[:, :, j] = np.where(~m[:, :, j], (log_beta + log_q), -np.inf)
 
-    # <<< CHANGED: Off ratio uses Δ(untempered) + β·ΔLL directly (no double-subtract) >>>
-    # Δ untempered part when turning i off:
-    delta_unscaled_off = delta_comp_off + delta_comb_off                          # (C,W,Kmax)
-    # log ratio: log π_off - log π_cur = Δunscaled_off + β * (ll_off - ll_cur)
-    log_ratio_off = delta_unscaled_off + beta_cw[:, :, None] * (ll_off - ll_cur[:, :, None])  # (C,W,Kmax)
-
-
-
+  
+    # Off-hazards, per slot i in log
     for i in range(Kmax):
         if qb_eval_variant == "child":
             ctx = m
         else:
-            ctx = m.copy()
-            ctx[:, :, i] = False
-        val = bd_rate_scale*qb_density_np(phi[:, :, i, :], ctx, phi, ps.rest)  # (C,W)
-        lam_off[:, :, i] = np.where(
+            ctx = m.copy(); ctx[:, :, i] = False
+        val = qb_density_np(phi[:, :, i, :], ctx, phi, ps.rest)     # (C,W)
+        log_q = _log_pos(val) + log_bd_scale                        # <<< NEW
+        log_lam_off[:, :, i] = np.where(
             m[:, :, i],
-            betas[:, None] * np.maximum(0.0, val) * np.exp(log_ratio_off[:, :, i]),
-            0.0
+            (log_beta + log_q) + log_ratio_off[:, :, i],
+            -np.inf
         )
 
-    lam_total = lam_on.sum(axis=-1) + lam_off.sum(axis=-1)  # (C,W)
-    return lam_on, lam_off, lam_total
+
+    # for i in range(Kmax):
+    #     if qb_eval_variant == "child":
+    #         ctx = m
+    #     else:
+    #         ctx = m.copy()
+    #         ctx[:, :, i] = False
+    #     val = bd_rate_scale*qb_density_np(phi[:, :, i, :], ctx, phi, ps.rest)  # (C,W)
+    #     lam_off[:, :, i] = np.where(
+    #         m[:, :, i],
+    #         betas[:, None] * np.maximum(0.0, val) * np.exp(log_ratio_off[:, :, i]),
+    #         0.0
+    #     )
+
+    # Total rate for waiting-time (linear), but sum via logsumexp
+    log_lam_all = np.concatenate([log_lam_on, log_lam_off], axis=2) # (C,W,2K)
+    # stable log-sum-exp along last axis
+    maxv = np.max(log_lam_all, axis=2)                                  # (C,W)
+    with np.errstate(over='ignore', invalid='ignore'):
+        sumexp = np.sum(np.exp(log_lam_all - maxv[..., None]), axis=2)  # (C,W)
+    # if all entries were -inf, maxv=-inf → set logsumexp to -inf
+    log_lam_total = np.where(np.isfinite(maxv), maxv + np.log(sumexp), -np.inf)  # (C,W)
+
+    # linear total rate for clocks (OK for zeros)
+    lam_total = np.where(np.isfinite(log_lam_total), np.exp(log_lam_total), 0.0)  # (C,W)
+
+    # lam_total = lam_on.sum(axis=-1) + lam_off.sum(axis=-1)  # (C,W)
+    return log_lam_on, log_lam_off, lam_total, log_lam_total
 
 
 # =============================================================================
@@ -855,6 +899,8 @@ def gibbs_mh_sweep_active_np(
     do_rw_eigenline: bool = False,
     do_rw_student_t: bool = False,
     do_de: bool = True,
+    do_PTswap: bool = True,
+    # proposal params
     stretch_a: float = 1.3,
     cross_rate: float = 0.7,
     gamma_de: float = 2.38,
@@ -915,6 +961,21 @@ def gibbs_mh_sweep_active_np(
         for n, (c, w) in enumerate(zip(idx[0], idx[1])):
             vals[n] = float(log_prior_phi_np(phi_slot_full[c, w]))
         return vals
+    
+    def validate_ll_snapshot(batched_ll_masked, phi_sel, m_sel, rest_sel, ll_sel):
+        """
+        Compare stored ll_sel (Csel,W) to a recomputation from phi_sel/m_sel/rest_sel.
+        Returns (max_abs_diff, per-temp per-walker diffs).
+        """
+        Csel, W, Kmax, d = phi_sel.shape
+        diffs = np.zeros((Csel, W), dtype=float)
+        for ci in range(Csel):
+            phi_c  = phi_sel[ci]          # (W,Kmax,d)
+            m_c    = m_sel[ci]            # (W,Kmax)
+            rest_c = None if rest_sel is None else rest_sel[ci]  # (W,Drest) or None
+            ll_re  = batched_ll_masked(phi_c, m_c, rest_c)       # (W,)
+            diffs[ci] = np.abs(ll_re - ll_sel[ci])
+        return float(diffs.max()), diffs
 
     # --- end helpers ----------------------------------------------------------
 
@@ -984,7 +1045,7 @@ def gibbs_mh_sweep_active_np(
             if c_idx.size:
                 phi_prop[c_idx, w_idx, j, :] = prop2[c_idx, w_idx, slot_sel]
 
-            ll_prop = lps.copy()
+            ll_prop = ll_cur.copy()
             if c_idx.size:
                 ll_prop_sub, _ = _masked_ll_subset(phi_prop, m, rest, (c_idx, w_idx))
                 ll_prop[c_idx, w_idx] = ll_prop_sub
@@ -1011,6 +1072,16 @@ def gibbs_mh_sweep_active_np(
                     move_type="stretch", slot_j=j, accepted_mask=accept,
                     pt=pt_state, ps=ps_state
                 )
+            # --- LL consistency self-check (debug) ---
+            maxdiff, diffs = validate_ll_snapshot(
+                batched_loglik_masked,
+                run_trace.mh_ticks[-1].submoves[-1].phi_sel,
+                run_trace.mh_ticks[-1].submoves[-1].m_sel,
+                None,
+                run_trace.mh_ticks[-1].submoves[-1].ll_sel,
+            )
+            if maxdiff > 1e-6:  # choose your tolerance
+                print(f"[warn] LL mismatch after STRETCH slot {j}: max |Δ|={maxdiff:.3e}")
 
         # --- RW fullcov ---
         if do_rw_fullcov and (Ls is not None):
@@ -1027,7 +1098,7 @@ def gibbs_mh_sweep_active_np(
             # compute masked-LL only on attempted subset
             ll_prop_sub, _ = _masked_ll_subset(phi_prop, m, rest, (c_idx, w_idx))
             # scatter into a full (C,W) array for the accept function
-            ll_prop = lps.copy()          # start from current masked LL
+            ll_prop = ll_cur.copy()          # start from current masked LL
             if c_idx.size:
                 ll_prop[c_idx, w_idx] = ll_prop_sub
 
@@ -1057,6 +1128,16 @@ def gibbs_mh_sweep_active_np(
                     move_type="rw_fullcov", slot_j=j, accepted_mask=accept,
                     pt=pt_state, ps=ps_state
                 )
+            # --- LL consistency self-check (debug) ---
+            maxdiff, diffs = validate_ll_snapshot(
+                batched_loglik_masked,
+                run_trace.mh_ticks[-1].submoves[-1].phi_sel,
+                run_trace.mh_ticks[-1].submoves[-1].m_sel,
+                None,
+                run_trace.mh_ticks[-1].submoves[-1].ll_sel,
+            )
+            if maxdiff > 1e-6:  # choose your tolerance
+                print(f"[warn] LL mismatch after RW slot {j}: max |Δ|={maxdiff:.3e}")
 
         # --- RW eigenline ---
         if do_rw_eigenline and (U is not None) and (S is not None):
@@ -1073,7 +1154,7 @@ def gibbs_mh_sweep_active_np(
             # compute masked-LL only on attempted subset
             ll_prop_sub, _ = _masked_ll_subset(phi_prop, m, rest, (c_idx, w_idx))
             # scatter into a full (C,W) array for the accept function
-            ll_prop = lps.copy()          # start from current masked LL
+            ll_prop = ll_cur.copy()          # start from current masked LL
             if c_idx.size:
                 ll_prop[c_idx, w_idx] = ll_prop_sub
 
@@ -1120,7 +1201,7 @@ def gibbs_mh_sweep_active_np(
             # compute masked-LL only on attempted subset
             ll_prop_sub, _ = _masked_ll_subset(phi_prop, m, rest, (c_idx, w_idx))
             # scatter into a full (C,W) array for the accept function
-            ll_prop = lps.copy()          # start from current masked LL
+            ll_prop = ll_cur.copy()          # start from current masked LL
             if c_idx.size:
                 ll_prop[c_idx, w_idx] = ll_prop_sub
 
@@ -1168,7 +1249,7 @@ def gibbs_mh_sweep_active_np(
                 phi_prop[c_idx, w_idx, j, :] = prop[c_idx, w_idx, slot_sel]
 
             # masked-LL only on attempted subset; scatter back
-            ll_prop = lps.copy()
+            ll_prop = ll_cur.copy()
             if c_idx.size:
                 ll_prop_sub, _ = _masked_ll_subset(phi_prop, m, rest, (c_idx, w_idx))
                 ll_prop[c_idx, w_idx] = ll_prop_sub
@@ -1198,30 +1279,41 @@ def gibbs_mh_sweep_active_np(
                     move_type="de", slot_j=j, accepted_mask=accept,
                     pt=pt_state, ps=ps_state
                 )
+            # --- LL consistency self-check (debug) ---
+            maxdiff, diffs = validate_ll_snapshot(
+                batched_loglik_masked,
+                run_trace.mh_ticks[-1].submoves[-1].phi_sel,
+                run_trace.mh_ticks[-1].submoves[-1].m_sel,
+                None,
+                run_trace.mh_ticks[-1].submoves[-1].ll_sel,
+            )
+            if maxdiff > 1e-6:  # choose your tolerance
+                print(f"[warn] LL mismatch after DE slot {j}: max |Δ|={maxdiff:.3e}")
 
-    # PT swaps (even + odd), record attempts
-    pt_state = PTState(thetas=thetas, log_probs=lps)
-    # even pass
-    pt_state, acc_e, att_e = pt_swap_pass_numpy(rng, pt_state, betas, even_pass=True)
-    ps_swap_pass_inplace(ps_state, acc_e, even_pass=True)
-    # odd pass  
-    pt_state, acc_o, att_o = pt_swap_pass_numpy(rng, pt_state, betas, even_pass=False)
-    ps_swap_pass_inplace(ps_state, acc_o, even_pass=False)
+    if do_PTswap:
+        # PT swaps (even + odd), record attempts
+        pt_state = PTState(thetas=thetas, log_probs=lps)
+        # even pass
+        pt_state, acc_e, att_e = pt_swap_pass_numpy(rng, pt_state, betas, even_pass=True)
+        ps_swap_pass_inplace(ps_state, acc_e, even_pass=True)
+        # odd pass  
+        pt_state, acc_o, att_o = pt_swap_pass_numpy(rng, pt_state, betas, even_pass=False)
+        ps_swap_pass_inplace(ps_state, acc_o, even_pass=False)
 
-    C, W = pt_state.thetas.shape[:2]
-    acc_pt = acc_e | acc_o
-    att_pt = att_e | att_o
-    for c in range(C):
-        for w in range(W):
-            if att_pt[c, w]:
-                event_log.mh_events.append(
-                    MHEvent(t_abs=t_abs, dt=dt, c=c, w=w, slot=-1, move_type="ptswap", accepted=bool(acc_pt[c, w]))
-                )
-    if run_trace is not None:
-        run_trace.add_submove_snapshot(
-            move_type="ptswap", slot_j=-1, accepted_mask=acc_pt,
-            pt=pt_state, ps=ps_state
-        )
+        C, W = pt_state.thetas.shape[:2]
+        acc_pt = acc_e | acc_o
+        att_pt = att_e | att_o
+        for c in range(C):
+            for w in range(W):
+                if att_pt[c, w]:
+                    event_log.mh_events.append(
+                        MHEvent(t_abs=t_abs, dt=dt, c=c, w=w, slot=-1, move_type="ptswap", accepted=bool(acc_pt[c, w]))
+                    )
+        if run_trace is not None:
+            run_trace.add_submove_snapshot(
+                move_type="ptswap", slot_j=-1, accepted_mask=acc_pt,
+                pt=pt_state, ps=ps_state
+            )
     return pt_state
 
 
@@ -1230,6 +1322,12 @@ def gibbs_mh_sweep_active_np(
 # =============================================================================
 
 from tqdm import tqdm
+
+# --- DEBUG knobs ---------------------------------------------------------  # ### ADDED
+_DO_BD_DB_CHECK = True                                                      # ### ADDED
+_DB_TOL = 1e-2              # |lhs - rhs| tolerance for detailed balance    # ### ADDED
+_EPS = 1e-300               # log-safe epsilon for hazards                  # ### ADDED
+_LL_HARD_MIN = -1e12        # flag very bad LL                               # ### ADDED
 
 def run_epoch_ct_numpy(
     *,
@@ -1253,6 +1351,8 @@ def run_epoch_ct_numpy(
     log_lik_masked_jax: Callable[[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray]], jnp.ndarray],
     # θ slot mapping (length Kmax): each element is a slice or a bool mask over D
     slot_slices: Tuple,
+    ### scale for BD rate
+    bd_rate_scale: float = 1.0,    # <<< NEW
     # RW resources for MH
     Ls: Optional[np.ndarray] = None,       # (C,D,D)
     U: Optional[np.ndarray]  = None,       # (C,D,D)
@@ -1263,6 +1363,7 @@ def run_epoch_ct_numpy(
     do_rw_eigenline: bool = False,
     do_rw_student_t: bool = False,
     do_de: bool = True,
+    do_PTswap: bool = True,
     stretch_a: float = 1.3,
     cross_rate: float = 0.7,
     gamma_de: float = 2.38,
@@ -1280,6 +1381,7 @@ def run_epoch_ct_numpy(
 
     rng = np.random.default_rng(seed)
     batched_ll_masked = make_batched_loglik_masked(log_lik_masked_jax)
+    DO_BD = (float(bd_rate_scale) > 0.0) 
 
     C, W, D = pt_init.thetas.shape
     Kmax = ps_init.m.shape[-1]
@@ -1311,12 +1413,12 @@ def run_epoch_ct_numpy(
 
     # initial BD clocks: sample from Exp(Λ(c,w))
     # compute hazards once to seed clocks
-    lam_on, lam_off, lam_total = compute_bd_hazards_all(
+    _, _, lam_total, _ = compute_bd_hazards_all(
         ps, betas,
         qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
         log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
         log_p_k_np=log_p_k_np,
-        batched_loglik_masked=batched_ll_masked
+        batched_loglik_masked=batched_ll_masked,  bd_rate_scale=bd_rate_scale
     )
     T_bd = np.full((C, W), np.inf, dtype=np.float64)
     with np.errstate(divide='ignore'):
@@ -1340,118 +1442,251 @@ def run_epoch_ct_numpy(
             # process BD events up to t_next in chronological order
             # print ('debug: entering BD event processing loop')
             cnt = 0
-            while True:
-                # pick the nearest BD event in (absolute) time across all walkers (C, W)
-                idx_min = np.argmin(T_bd)  # flat index
-                c_min = int(idx_min // W)
-                w_min = int(idx_min %  W)
-                t_bd = T_bd[c_min, w_min]
-                if not np.isfinite(t_bd) or t_bd >= t_next:
-                    break # no more BD events before next MH tick
+            if DO_BD:
+                while True:
+                    # pick the nearest BD event in (absolute) time across all walkers (C, W)
+                    idx_min = np.argmin(T_bd)  # flat index
+                    c_min = int(idx_min // W)
+                    w_min = int(idx_min %  W)
+                    t_bd = T_bd[c_min, w_min]
+                    if not np.isfinite(t_bd) or t_bd >= t_next:
+                        break # no more BD events before next MH tick
 
-                # determine per-(c_min,w_min) hazards to sample a concrete slot event
-                # (We already have lam_on/off global, but they are stale if ps changed before; recompute for this chain.)
-                lam_on_cw, lam_off_cw, lam_total_cw = compute_bd_hazards_all(
+                    # determine per-(c_min,w_min) hazards to sample a concrete slot event
+                    # (We already have lam_on/off global, but they are stale if ps changed before; recompute for this chain.)
+                    
+                    # lam_on_cw, lam_off_cw, lam_total_cw = compute_bd_hazards_all(
+                    #     PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
+                    #             ps.m[c_min:c_min+1, w_min:w_min+1],
+                    #             None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
+                    #             ps.logpi[c_min:c_min+1, w_min:w_min+1]),
+                    #     betas[c_min:c_min+1],
+                    #     qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+                    #     log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+                    #     log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),  # adapter
+                    #     batched_loglik_masked=batched_ll_masked
+                    # )
+                    log_lam_on_cw, log_lam_off_cw, _, _ = compute_bd_hazards_all(           # <<< CHANGED
+                        PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
+                                ps.m[c_min:c_min+1,   w_min:w_min+1],
+                                None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
+                                ps.logpi[c_min:c_min+1, w_min:w_min+1]),
+                        betas[c_min:c_min+1],
+                        qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+                        log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+                        log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),
+                        batched_loglik_masked=batched_ll_masked, bd_rate_scale=bd_rate_scale
+                    )
+                    log_lam_on_cw  = log_lam_on_cw[0, 0]    # (Kmax,)                           # <<< CHANGED
+                    log_lam_off_cw = log_lam_off_cw[0, 0]   # (Kmax,)                           # <<< CHANGED
+
+                    # lam_on_cw = lam_on_cw[0, 0]     # (Kmax,)
+                    # lam_off_cw = lam_off_cw[0, 0]   # (Kmax,)
+        
+
+
+                    # ===== DEBUG BD CHECK (pre-event) =====
+                    # Recompute the *tempered* logπ for current (c_min,w_min) state
+                    m_cw_now    = ps.m[c_min, w_min].astype(bool)                # (Kmax,)   <-- ADDED
+                    phi_cw_now  = ps.phi[c_min, w_min].copy()                    # (Kmax,d)  <-- ADDED
+                    def tempered_logpi_single(phi_cw, m_cw, rest_cw, beta_c):
+                        # masked LL
+                        ll_here = batched_ll_masked(phi_cw[None, ...], m_cw[None, ...], None if rest_cw is None else rest_cw[None, ...])[0]
+                        # component + combinatorics
+                        comp = 0.0
+                        for i in range(phi_cw.shape[0]):  # Kmax
+                            comp += (log_prior_phi_np(phi_cw[i]) if m_cw[i] else log_pseudo_phi_np(phi_cw[i]))
+                        k_here = int(m_cw.astype(np.int32).sum())
+                        comb = float(log_p_k_np(np.array([[k_here]])).reshape(())) \
+                            + float(_log_uniform_masks_given_k(phi_cw.shape[0], np.array(k_here))) \
+                            + float(_log_symmetrization(np.array(k_here)))
+                        logpi_unscaled = comb + comp
+                        return float(logpi_unscaled + beta_c * ll_here), float(ll_here), float(logpi_unscaled)
+
+                    beta_c = float(betas[c_min])
+                    phi_cw_now  = ps.phi[c_min, w_min].copy()      # (Kmax,d)
+                    m_cw_now    = ps.m[c_min, w_min].astype(bool)  # (Kmax,)
+                    rest_cw_now = None if ps.rest is None else ps.rest[c_min, w_min].copy()
+
+                    logpi_cur_tempered, ll_cur, logpi_cur_unscaled = tempered_logpi_single(phi_cw_now, m_cw_now, rest_cw_now, beta_c)
+
+                    bad_on  = np.any(np.isfinite(log_lam_on_cw[m_cw_now]), axis=None)   # should be False
+                    bad_off = np.any(np.isfinite(log_lam_off_cw[~m_cw_now]), axis=None) # should be False
+                    if bad_on:  print("[BD DEBUG] λ_on active>0 ...")
+                    if bad_off: print("[BD DEBUG] λ_off inactive>0 ...")
+
+                    
+                    # Invariants: hazards must be finite and non-negative on proper supports
+                    # if not np.all(np.isfinite(lam_on_cw)) or not np.all(np.isfinite(lam_off_cw)):
+                    #     print(f"[BD DEBUG] non-finite hazard at c={c_min}, w={w_min}")
+                    # if (lam_on_cw[m_cw_now] > 0).any():   # on-rate must be zero where active
+                    #     print(f"[BD DEBUG] λ_on active>0 at c={c_min}, w={w_min}")
+                    # if (lam_off_cw[~m_cw_now] > 0).any(): # off-rate must be zero where inactive
+                    #     print(f"[BD DEBUG] λ_off inactive>0 at c={c_min}, w={w_min}")
+                    ######################################################
+
+                    # hazards = np.concatenate([lam_on_cw, lam_off_cw])
+                    # total = hazards.sum()
+                    # if total <= 0.0 or not np.isfinite(total):
+                    #     # no event; disable this clock
+                    #     T_bd[c_min, w_min] = np.inf
+                    #     continue
+
+                    # probs = hazards / total
+                    # idx = rng.choice(2 * Kmax, p=probs)
+                    # chosen_is_on = (idx < Kmax)
+                    # slot = idx if chosen_is_on else (idx - Kmax)
+
+                    # lam_used = float(lam_on_cw[slot] if chosen_is_on else lam_off_cw[slot])  # ### ADDED
+
+                    # --- robustness checks (now look for NaNs; -inf is OK) ---
+                    if np.isnan(log_lam_on_cw).any() or np.isnan(log_lam_off_cw).any():      # <<< CHANGED
+                        print(f"[BD DEBUG] NaN in log-hazard at c={c_min}, w={w_min}")
+
+                    # Build one log-vector [on..., off...]
+                    log_hazard_vec = np.concatenate([log_lam_on_cw, log_lam_off_cw])                # (2K,)  # <<< CHANGED
+                    if not np.isfinite(np.max(log_hazard_vec)):                                      # <<< CHANGED
+                        # all -inf → no BD event possible
+                        T_bd[c_min, w_min] = np.inf
+                        continue
+
+                    # ---- Gumbel–max selection in log-space ----                                   # <<< NEW
+                    g = -np.log(-np.log(np.clip(rng.random(log_hazard_vec.shape[0]), 1e-16, 1-1e-16)))
+                    idx = int(np.argmax(log_hazard_vec + g))                                         # <<< NEW
+                    chosen_is_on = (idx < Kmax)                                               # <<< CHANGED
+                    slot = idx if chosen_is_on else (idx - Kmax)                              # <<< CHANGED
+
+                    log_lam_used = float(log_hazard_vec[idx])                                        # <<< NEW
+
+
+                    # apply BD toggle
+                    phi_new = ps.phi.copy()
+                    m_new   = ps.m.copy()
+                    k_before = int(m_new[c_min, w_min].astype(np.int32).sum())
+                    if chosen_is_on:   # birth
+                        m_new[c_min, w_min, slot] = True
+                    else:              # death
+                        m_new[c_min, w_min, slot] = False
+                        phi_new[c_min, w_min, slot, :] = sample_pseudo_phi()
+
+                    # recompute current LL and logπ at (c_min,w_min)
+                    # Get ll_cur for this modified state
+                    phi_cw = phi_new[c_min, w_min][None, ...]   # (1,Kmax,d)
+                    m_cw   = m_new[c_min, w_min][None, ...]     # (1,Kmax)
+                    rest_cw = None if ps.rest is None else ps.rest[c_min, w_min][None, ...]
+                    
+                    ll_new = batched_ll_masked(phi_cw, m_cw, rest_cw)[0]
+
+
+                    # component & combinatorial terms
+                    comp = 0.0
+                    for i in range(Kmax):
+                        if m_new[c_min, w_min, i]:
+                            comp += float(log_prior_phi_np(phi_new[c_min, w_min, i]))
+                        else:
+                            comp += float(log_pseudo_phi_np(phi_new[c_min, w_min, i]))
+                    k_cur = int(m_new[c_min, w_min].astype(np.int32).sum())
+                    comb = float(log_p_k_np(np.array([[k_cur]])).reshape(())) \
+                        + float(_log_uniform_masks_given_k(Kmax, np.array(k_cur))) \
+                        + float(_log_symmetrization(np.array(k_cur)))
+                    logpi_cw = comb + comp + float(betas[c_min] * ll_new)
+
+                    ps = PSState(phi=phi_new, m=m_new, rest=ps.rest, logpi=ps.logpi.copy())
+                    ps.logpi[c_min, w_min] = logpi_cw
+
+                    # Keep PT and PS consistent right after BD
+                    pt.log_probs[c_min, w_min] = ll_new
+
+                    # Also sync PT θ for the affected slot so proposals start from PS state
+                    sl = slot_slices[slot]                   # slice/mask in θ-space for this φ_slot
+                    pt.thetas[c_min, w_min, sl] = phi_new[c_min, w_min, slot, :]
+
+                                    # ------------------- BD DEBUG (post-event) --------------------  # ### ADDED
+                    if _DO_BD_DB_CHECK:                                             # ### ADDED
+                        # recompute single-chain hazards at NEW state
+                        log_lam_on_new, log_lam_off_new, _, _ = compute_bd_hazards_all(          # <<< CHANGED
+                            PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
+                                    ps.m[c_min:c_min+1,   w_min:w_min+1],
+                                    None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
+                                    ps.logpi[c_min:c_min+1, w_min:w_min+1]),
+                            betas[c_min:c_min+1],
+                            qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+                            log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+                            log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),
+                            batched_loglik_masked=batched_ll_masked, bd_rate_scale=bd_rate_scale
+                        )
+                        log_lam_on_new  = log_lam_on_new[0, 0]                                    # <<< CHANGED
+                        log_lam_off_new = log_lam_off_new[0, 0]                                   # <<< CHANGED
+
+                        log_lam_rev = float(log_lam_off_new[slot] if chosen_is_on                # <<< CHANGED
+                                            else log_lam_on_new[slot])
+                        log_lam_rev = float(log_lam_off_new[slot] if chosen_is_on else log_lam_on_new[slot])
+                        if log_lam_rev < -800:
+                            print(f"[BD REV-FLOOR] c={c_min} w={w_min} slot={slot} logλ_rev={log_lam_rev:.1f} "
+                                    f"Δlogπ≈{(logpi_cw - logpi_cur_tempered):.1f}")
+
+                        lhs = logpi_cur_tempered + log_lam_used                                   # <<< CHANGED
+                        rhs = logpi_cw            + log_lam_rev                                   # <<< CHANGED
+                        db_resid = lhs - rhs
+
+                        if (not np.isfinite(db_resid)) or (abs(db_resid) > _DB_TOL):  # ### ADDED
+                            print(                                                    # ### ADDED
+                                f"[BD DB-RESID] c={c_min} w={w_min} "                 # ### ADDED
+                                f"{'birth' if chosen_is_on else 'death'} slot={slot} " # ### ADDED
+                                f"resid={db_resid:.3e}  ll_cur={ll_cur:.3e} ll_new={ll_new:.3e}"  # ### ADDED
+                            )                                                         # ### ADDED
+
+                        # LL anomaly check                                            # ### ADDED
+                        if (not np.isfinite(ll_new)) or (ll_new < _LL_HARD_MIN):      # ### ADDED
+                            print(                                                    # ### ADDED
+                                f"[BD LL-ANOM] c={c_min} w={w_min} "                  # ### ADDED
+                                f"{'birth' if chosen_is_on else 'death'} slot={slot} " # ### ADDED
+                                f"k {k_before}->{k_cur}  ll_new={ll_new:.3e}"         # ### ADDED
+                            )                                                         # ### ADDED
+
+                                             # DEBUG this is the birth slot we just turned on; check if it was pseudo right before
+                        was_pseudo = not m_cw_now[slot]   # True by definition for a birth
+                        # if was_pseudo:
+                        #     delta_ll = ll_new - ll_cur
+                        #     if delta_ll < -200:     # tune threshold to your scale
+                        #         print(f"[BD BIRTH→PSEUDO] c={c_min} w={w_min} slot={slot} Δll={delta_ll:.1f}")
+                    # ----------------- end BD DEBUG (post-event) -------------------  # ### ADDED
+
+                    # log event
+                    ev = BDEvent(
+                        t_abs=t_bd,
+                        dt=t_bd - t,
+                        kind=(0 if chosen_is_on else 1),
+                        c=c_min, w=w_min,
+                        slot=int(slot),
+                        k_before=k_before,
+                        k_after=int(m_new[c_min, w_min].astype(np.int32).sum())
+                    )
+                    events.bd_events.append(ev)
+                    if tr is not None:
+                        tr.add_bd_event(ev, ps, with_snapshot=True)
+
+                    # advance "now" to this BD time for subsequent events
+                    t = t_bd
+
+                    # redraw this chain's next absolute BD time from its new Λ(c,w)
+                    _, _, lam_total_single, _ = compute_bd_hazards_all(
                     PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
                             ps.m[c_min:c_min+1, w_min:w_min+1],
                             None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
                             ps.logpi[c_min:c_min+1, w_min:w_min+1]),
-                    betas[c_min:c_min+1],
-                    qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
-                    log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
-                    log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),  # adapter
-                    batched_loglik_masked=batched_ll_masked
-                )
-                lam_on_cw = lam_on_cw[0, 0]     # (Kmax,)
-                lam_off_cw = lam_off_cw[0, 0]   # (Kmax,)
-                hazards = np.concatenate([lam_on_cw, lam_off_cw])
-                total = hazards.sum()
-                if total <= 0.0 or not np.isfinite(total):
-                    # no event; disable this clock
-                    T_bd[c_min, w_min] = np.inf
-                    continue
-
-                probs = hazards / total
-                idx = rng.choice(2 * Kmax, p=probs)
-                chosen_is_on = (idx < Kmax)
-                slot = idx if chosen_is_on else (idx - Kmax)
-
-                # apply BD toggle
-                phi_new = ps.phi.copy()
-                m_new   = ps.m.copy()
-                k_before = int(m_new[c_min, w_min].astype(np.int32).sum())
-                if chosen_is_on:   # birth
-                    m_new[c_min, w_min, slot] = True
-                else:              # death
-                    m_new[c_min, w_min, slot] = False
-                    phi_new[c_min, w_min, slot, :] = sample_pseudo_phi()
-
-                # recompute current LL and logπ at (c_min,w_min)
-                # Get ll_cur for this modified state
-                phi_cw = phi_new[c_min, w_min][None, ...]   # (1,Kmax,d)
-                m_cw   = m_new[c_min, w_min][None, ...]     # (1,Kmax)
-                rest_cw = None if ps.rest is None else ps.rest[c_min, w_min][None, ...]
-                
-                ll_new = batched_ll_masked(phi_cw, m_cw, rest_cw)[0]
-
-                # component & combinatorial terms
-                comp = 0.0
-                for i in range(Kmax):
-                    if m_new[c_min, w_min, i]:
-                        comp += float(log_prior_phi_np(phi_new[c_min, w_min, i]))
+                            betas[c_min:c_min+1],
+                            qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+                            log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+                            log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),
+                            batched_loglik_masked=batched_ll_masked,  bd_rate_scale=bd_rate_scale
+                    )
+                    lam_next = lam_total_single[0, 0]
+                    if lam_next > 0.0 and np.isfinite(lam_next):
+                        T_bd[c_min, w_min] = t + rng.exponential(1.0 / lam_next)
                     else:
-                        comp += float(log_pseudo_phi_np(phi_new[c_min, w_min, i]))
-                k_cur = int(m_new[c_min, w_min].astype(np.int32).sum())
-                comb = float(log_p_k_np(np.array([[k_cur]])).reshape(())) \
-                    + float(_log_uniform_masks_given_k(Kmax, np.array(k_cur))) \
-                    + float(_log_symmetrization(np.array(k_cur)))
-                logpi_cw = comb + comp + float(betas[c_min] * ll_new)
-
-                ps = PSState(phi=phi_new, m=m_new, rest=ps.rest, logpi=ps.logpi.copy())
-                ps.logpi[c_min, w_min] = logpi_cw
-
-                # Keep PT and PS consistent right after BD
-                pt.log_probs[c_min, w_min] = ll_new
-
-                # Also sync PT θ for the affected slot so proposals start from PS state
-                sl = slot_slices[slot]                   # slice/mask in θ-space for this φ_slot
-                pt.thetas[c_min, w_min, sl] = phi_new[c_min, w_min, slot, :]
-
-                # log event
-                ev = BDEvent(
-                    t_abs=t_bd,
-                    dt=t_bd - t,
-                    kind=(0 if chosen_is_on else 1),
-                    c=c_min, w=w_min,
-                    slot=int(slot),
-                    k_before=k_before,
-                    k_after=int(m_new[c_min, w_min].astype(np.int32).sum())
-                )
-                events.bd_events.append(ev)
-                if tr is not None:
-                    tr.add_bd_event(ev, ps, with_snapshot=True)
-
-                # advance "now" to this BD time for subsequent events
-                t = t_bd
-
-                # redraw this chain's next absolute BD time from its new Λ(c,w)
-                lam_on, lam_off, lam_total_single = compute_bd_hazards_all(
-                    PSState(ps.phi[c_min:c_min+1, w_min:w_min+1],
-                            ps.m[c_min:c_min+1, w_min:w_min+1],
-                            None if ps.rest is None else ps.rest[c_min:c_min+1, w_min:w_min+1],
-                            ps.logpi[c_min:c_min+1, w_min:w_min+1]),
-                    betas[c_min:c_min+1],
-                    qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
-                    log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
-                    log_p_k_np=lambda k: log_p_k_np(k).reshape(1,1),
-                    batched_loglik_masked=batched_ll_masked
-                )
-                lam_next = lam_total_single[0, 0]
-                if lam_next > 0.0 and np.isfinite(lam_next):
-                    T_bd[c_min, w_min] = t + rng.exponential(1.0 / lam_next)
-                else:
-                    T_bd[c_min, w_min] = np.inf
-                cnt += 1
+                        T_bd[c_min, w_min] = np.inf
+                    cnt += 1
             # print ('debug cnt =', cnt)
 
             if tr is not None:
@@ -1471,6 +1706,7 @@ def run_epoch_ct_numpy(
                 do_rw_eigenline=do_rw_eigenline,
                 do_rw_student_t=do_rw_student_t,
                 do_de=do_de,
+                do_PTswap=do_PTswap,
                 stretch_a=stretch_a,
                 cross_rate=cross_rate,
                 gamma_de=gamma_de,
@@ -1479,18 +1715,26 @@ def run_epoch_ct_numpy(
             )
 
             # reset all BD clocks after MH (memoryless, and hazards may change via θ)
-            lam_on, lam_off, lam_total = compute_bd_hazards_all(
-                ps, betas,
-                qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
-                log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
-                log_p_k_np=log_p_k_np,
-                batched_loglik_masked=batched_ll_masked
-            )
-            T_bd[:] = np.inf
-            with np.errstate(divide='ignore'):
-                mask_pos = lam_total > 0.0
-                T_bd[mask_pos] = rng.exponential(1.0 / lam_total[mask_pos])
-            T_bd += t_next
+            # lam_on, lam_off, lam_total = compute_bd_hazards_all(
+            #     ps, betas,
+            #     qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+            #     log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+            #     log_p_k_np=log_p_k_np,
+            #     batched_loglik_masked=batched_ll_masked
+            # )
+            if DO_BD:
+                _, _, lam_total, _ = compute_bd_hazards_all(
+                    ps, betas,
+                    qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+                    log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+                    log_p_k_np=log_p_k_np,
+                    batched_loglik_masked=batched_ll_masked,  bd_rate_scale=bd_rate_scale
+                )
+                T_bd[:] = np.inf
+                with np.errstate(divide='ignore'):
+                    mask_pos = lam_total > 0.0
+                    T_bd[mask_pos] = rng.exponential(1.0 / lam_total[mask_pos])
+                T_bd += t_next
 
             # advance to MH time
             t = t_next
@@ -1504,1012 +1748,16 @@ def run_epoch_ct_numpy(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # =============================================================================
-# #                    Tempered product-space log target (NumPy)
-# # =============================================================================
-
-# ### maybe use look-up table for a range of Kmax
-
-# def _log_uniform_masks_given_k(Kmax: int, k: int) -> float:
-#     # log p(m | k) = -log binom(Kmax, k)
-#     return - (float(gammaln(Kmax + 1.)) - float(gammaln(k + 1.)) - float(gammaln(Kmax - k + 1.)))
-
-# def _log_symmetrization(k: int) -> float:
-#     # log (1/k!) = -log(k!)
-#     return -float(gammaln(k + 1.0))
-
-# def _logpi_extended_untempered_numpy(
-#     phi_kwd: np.ndarray,                 # (Kmax,d)
-#     m_k: np.ndarray,                     # (Kmax,) bool
-#     rest_d: Optional[np.ndarray],        # (Drest,) or None
-#     log_prior_phi: Callable[[np.ndarray], float],
-#     log_pseudo_phi: Callable[[np.ndarray], float],
-#     log_lik_masked: Callable[[np.ndarray, np.ndarray, Optional[np.ndarray]], float],  # (Kmax,d),(Kmax,),rest->()
-#     log_p_k: Callable[[int], float],
-#     Kmax: int,
-# ) -> float:
-    
-#     k = int(m_k.astype(np.int32).sum())
-#     comp = 0.0
-#     for i in range(Kmax):
-#         if m_k[i]:
-#             comp += float(log_prior_phi(phi_kwd[i]))
-#         else:
-#             comp += float(log_pseudo_phi(phi_kwd[i]))
-#     ll = float(log_lik_masked(phi_kwd, m_k, rest_d))
-#     return ( float(log_p_k(k))
-#            + _log_uniform_masks_given_k(Kmax, k)
-#            + _log_symmetrization(k)
-#            + comp + ll )
-
-# def _logpi_tempered_cw_numpy(
-#     phi_cw: np.ndarray,                 # (Kmax,d)
-#     m_cw: np.ndarray,                   # (Kmax,) bool
-#     rest_cw: Optional[np.ndarray],      # (Drest,) or None
-#     beta: float,
-#     log_prior_phi, log_pseudo_phi, log_lik_masked, log_p_k,
-#     Kmax: int,
-# ) -> float:
-#     # Prior terms unscaled; likelihood scaled by beta.
-#     # Compute untempered parts and add beta * LL
-#     # First get the untempered except LL
-#     comp = 0.0
-#     for i in range(Kmax):
-#         if m_cw[i]:
-#             comp += float(log_prior_phi(phi_cw[i]))
-#         else:
-#             comp += float(log_pseudo_phi(phi_cw[i]))
-#     k = int(m_cw.astype(np.int32).sum())
-#     base = float(log_p_k(k)) + _log_uniform_masks_given_k(Kmax, k) + _log_symmetrization(k) + comp
-#     ll = float(log_lik_masked(phi_cw, m_cw, rest_cw))
-#     return base + beta * ll
-
-
-# # =============================================================================
-# #                        Hazards for one (c,w) chain (NumPy)
-# # =============================================================================
-
-# def compute_bd_hazards_one_chain(
-#     phi_cw: np.ndarray, m_cw: np.ndarray, rest_cw: Optional[np.ndarray],
-#     *,
-#     beta: float,
-#     qb_density: Callable[[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]], float],
-#     qb_eval_variant: Literal["child","parent"],
-#     log_prior_phi, log_pseudo_phi, log_lik_masked, log_p_k,
-#     Kmax: int,
-# ) -> Tuple[np.ndarray, np.ndarray, float]:
-#     """
-#     Returns (lam_on[Kmax], lam_off[Kmax], lam_total) for one (c,w).
-#     """
-
-#     lam_on = np.zeros((Kmax,), dtype=np.float64)
-#     lam_off = np.zeros((Kmax,), dtype=np.float64)
-
-#     # precompute logpi_off(i) for active i
-#     # (Vectorization not needed; Kmax is small.)
-#     logpi_cur = _logpi_tempered_cw_numpy(
-#         phi_cw, m_cw, rest_cw, beta,
-#         log_prior_phi, log_pseudo_phi, log_lik_masked, log_p_k, Kmax
-#     )
-#     logpi_off = np.full((Kmax,), -np.inf, dtype=np.float64)
-#     for i in range(Kmax):
-#         m_off = m_cw.copy()
-#         m_off[i] = False
-#         logpi_off[i] = _logpi_tempered_cw_numpy(
-#             phi_cw, m_off, rest_cw, beta,
-#             log_prior_phi, log_pseudo_phi, log_lik_masked, log_p_k, Kmax
-#         )
-
-#     # on hazards
-#     for j in range(Kmax):
-#         if not m_cw[j]:
-#             if qb_eval_variant == "child":
-#                 ctx = m_cw.copy(); ctx[j] = True
-#             else:
-#                 ctx = m_cw
-#             val = float(qb_density(phi_cw[j], ctx, phi_cw, rest_cw))
-#             lam_on[j] = max(0.0, beta * val)
-#         else:
-#             lam_on[j] = 0.0
-
-#     # off hazards
-#     for i in range(Kmax):
-#         if m_cw[i]:
-#             if qb_eval_variant == "child":
-#                 ctx = m_cw
-#             else:
-#                 ctx = m_cw.copy(); ctx[i] = False
-#             val = float(qb_density(phi_cw[i], ctx, phi_cw, rest_cw))
-#             ratio = float(np.exp(logpi_off[i] - logpi_cur))
-#             lam_off[i] = max(0.0, beta * val * ratio)
-#         else:
-#             lam_off[i] = 0.0
-
-#     lam_total = float(lam_on.sum() + lam_off.sum())
-#     return lam_on, lam_off, lam_total
-
-
-# # =============================================================================
-# #                         BD event firing for one (c,w)
-# # =============================================================================
-
-# def fire_one_bd_event_cw(
-#     rng: np.random.Generator,
-#     ps: PSState,
-#     c: int, w: int,
-#     *,
-#     beta: float,
-#     qb_density, qb_eval_variant,
-#     log_prior_phi, log_pseudo_phi, log_lik_masked, log_p_k,
-#     sample_pseudo_phi: Callable[[], np.ndarray],
-#     Kmax: int,
-# ) -> Tuple[PSState, Optional[BDEvent], float]:
-#     """
-#     Compute hazards, sample one BD event for chain (c,w), update ps.
-#     Returns (new_state, bd_event_or_None, lam_total_after).
-#     """
-#     phi_cw = ps.phi[c, w]              # (Kmax,d)
-#     m_cw   = ps.m[c, w].copy()         # (Kmax,)
-#     rest_cw = None if ps.rest is None else ps.rest[c, w]
-
-#     lam_on, lam_off, lam_total = compute_bd_hazards_one_chain(
-#         phi_cw, m_cw, rest_cw,
-#         beta=beta, qb_density=qb_density, qb_eval_variant=qb_eval_variant,
-#         log_prior_phi=log_prior_phi, log_pseudo_phi=log_pseudo_phi,
-#         log_lik_masked=log_lik_masked, log_p_k=log_p_k, Kmax=Kmax,
-#     )
-#     if lam_total <= 0.0 or not np.isfinite(lam_total):
-#         return ps, None, 0.0
-
-#     hazards = np.concatenate([lam_on, lam_off])
-#     probs = hazards / hazards.sum()
-#     idx = rng.choice(2*Kmax, p=probs)
-#     chosen_is_on = (idx < Kmax)
-#     slot = idx if chosen_is_on else (idx - Kmax)
-
-#     phi_new = ps.phi.copy()
-#     m_new   = ps.m.copy()
-#     k_before = int(m_new[c, w].astype(np.int32).sum())
-
-#     if chosen_is_on:     # birth
-#         m_new[c, w, slot] = True
-#     else:                # death
-#         m_new[c, w, slot] = False
-#         phi_new[c, w, slot, :] = sample_pseudo_phi()
-
-#     logpi_new = ps.logpi.copy()
-#     logpi_new[c, w] = _logpi_tempered_cw_numpy(
-#         phi_new[c, w], m_new[c, w], rest_cw,
-#         beta, log_prior_phi, log_pseudo_phi, log_lik_masked, log_p_k, Kmax
-#     )
-
-#     k_after = int(m_new[c, w].astype(np.int32).sum())
-#     new_state = PSState(phi=phi_new, m=m_new, rest=ps.rest, logpi=logpi_new)
-#     ev = BDEvent(t_abs=0.0, dt=0.0, kind=(0 if chosen_is_on else 1), c=c, w=w,
-#                  slot=int(slot), k_before=k_before, k_after=k_after)
-#     return new_state, ev, lam_total
-
-
-# # =============================================================================
-# #               Lightweight JAX-key manager (for proposal kernels)
-# # =============================================================================
-
-# class JaxKeySeq:
-#     """Deterministic stream of JAX PRNGKeys from a base seed."""
-#     def __init__(self, seed: int = 0):
-#         self.key = random.PRNGKey(seed)
-#         self.counter = 0
-
-#     def next(self) -> random.PRNGKey:
-#         self.key, sub = random.split(self.key)
-#         self.counter += 1
-#         return sub
-
-#     def fold(self, i: int) -> random.PRNGKey:
-#         return random.fold_in(self.key, i)
-
-
-# # =============================================================================
-# #           NumPy↔JAX wrappers around your proposal kernels (per-slot)
-# # =============================================================================
-
-# def _np_to_jnp(x: np.ndarray) -> jnp.ndarray:
-#     return jnp.asarray(x)
-
-# def _jnp_to_np(x: jnp.ndarray) -> np.ndarray:
-#     return np.array(x)
-
-# def propose_stretch_np(
-#     keys: Tuple[random.PRNGKey, random.PRNGKey, random.PRNGKey, random.PRNGKey, random.PRNGKey],
-#     X_np: np.ndarray,                # (C,W,D)
-#     move_mask_np: np.ndarray,        # (C,W) bool
-#     a: float,
-# ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-#     k_mask, k_p1, k_z1, k_p2, k_z2 = keys
-#     C, W, D = X_np.shape
-#     X = _np_to_jnp(X_np)
-#     move_mask = _np_to_jnp(move_mask_np.astype(bool))
-
-#     # Red/blue split (JAX)
-#     red, blue = redblue_mask(k_mask, C, W)
-#     red = red & move_mask
-#     blue = blue & move_mask
-
-#     # Half A: red moves using blue pool
-#     prop1, logJ1, partner1, has1, _ = _propose_stretch_redblue(k_p1, k_z1, X, subset_mask=red, a=a, z=None)
-#     # Half B: blue moves using UPDATED red pool
-#     prop2, logJ2, partner2, has2, _ = _propose_stretch_redblue(k_p2, k_z2, prop1, subset_mask=blue, a=a, z=None)
-
-#     # Combine: we return the final proposals (prop2) and total log-Jacobian per walker
-#     # (logJ from whichever half actually moved that walker)
-#     # For simplicity, expose logJ2; the MH uses mask to gate updates anyway.
-#     return _jnp_to_np(prop2), _jnp_to_np(logJ2), _jnp_to_np(blue | red)
-
-
-# def propose_rw_fullcov_np(
-#     key: random.PRNGKey,
-#     X_np: np.ndarray,                # (C,W,D)
-#     Ls_np: np.ndarray,               # (C,D,D)
-# ) -> np.ndarray:
-#     X = _np_to_jnp(X_np)
-#     Ls = _np_to_jnp(Ls_np)
-#     out = _propose_fullcov(key, X, Ls, scale=None)
-#     return _jnp_to_np(out)
-
-# def propose_rw_eigenline_np(
-#     keys: Tuple[random.PRNGKey, random.PRNGKey],
-#     X_np: np.ndarray,                # (C,W,D)
-#     U_np: np.ndarray,                # (C,D,D)
-#     S_np: np.ndarray,                # (C,D)
-# ) -> np.ndarray:
-#     k_axis, k_noise = keys
-#     X = _np_to_jnp(X_np)
-#     U = _np_to_jnp(U_np); S = _np_to_jnp(S_np)
-#     out = _propose_eigenline(k_axis, k_noise, X, U, S, scale=None)
-#     return _jnp_to_np(out)
-
-# def propose_rw_student_t_np(
-#     keys: Tuple[random.PRNGKey, random.PRNGKey],
-#     X_np: np.ndarray,                # (C,W,D)
-#     Ls_np: np.ndarray,               # (C,D,D)
-#     nu: float = 5.0,
-# ) -> np.ndarray:
-#     k_norm, k_gam = keys
-#     X = _np_to_jnp(X_np); Ls = _np_to_jnp(Ls_np)
-#     out = _propose_student_t(k_norm, k_gam, X, Ls, scale=None, nu=nu)
-#     return _jnp_to_np(out)
-
-# def propose_de_np(
-#     keys: Tuple[random.PRNGKey, random.PRNGKey],
-#     X_np: np.ndarray,                       # (C,W,D)
-#     eligible_mask_np: np.ndarray,           # (C,W) bool (who can be parent/partner)
-#     crossover_rate: float,
-#     gamma_scale: float,
-# ) -> Tuple[np.ndarray, np.ndarray]:
-#     kp, kg = keys
-#     X = _np_to_jnp(X_np)
-#     elig = _np_to_jnp(eligible_mask_np.astype(bool))
-#     prop, idx_y, idx_z, has_pair, mask = _propose_de_two_point(
-#         kp, kg, X, z=None, same_z_required=True,
-#         gamma=None, gamma_scale=gamma_scale,
-#         crossover_rate=crossover_rate, jitter_scale=1e-6,
-#         eligible_mask=elig
-#     )
-#     # Return only prop and has_pair mask (others are for diagnostics)
-#     return _jnp_to_np(prop), _jnp_to_np(has_pair)
-
-
-# # =============================================================================
-# #             Utilities: slot restriction & MH accept / update / log
-# # =============================================================================
-
-# def restrict_slot(prop_all: np.ndarray, cur_all: np.ndarray, slot_slice_or_mask) -> np.ndarray:
-#     """Keep proposed values only on slot coordinates; elsewhere keep current."""
-#     out = cur_all.copy()
-#     if isinstance(slot_slice_or_mask, slice):
-#         sl = slot_slice_or_mask
-#         out[..., sl] = prop_all[..., sl]
-#     else:
-#         maskD = np.asarray(slot_slice_or_mask, dtype=bool)[None, None, :]
-#         out = np.where(maskD, prop_all, cur_all)
-#     return out
-
-# def mh_accept_tempered(
-#     rng: np.random.Generator,
-#     lp_cur: np.ndarray,          # (C,W)
-#     lp_prop: np.ndarray,         # (C,W)
-#     betas: np.ndarray,           # (C,)
-#     log_qcorr: np.ndarray,       # (C,W)
-#     move_mask: np.ndarray,       # (C,W)
-# ) -> np.ndarray:
-#     delta = (lp_prop - lp_cur) * betas[:, None] + log_qcorr
-#     log_u = np.log(rng.random(lp_cur.shape))
-#     accept = (log_u < np.minimum(0.0, delta)) & move_mask
-#     return accept
-
-# def apply_mh_and_record(
-#     rng: np.random.Generator,
-#     event_log: EventLog,
-#     t_abs: float, dt: float, slot_j: int, move_type: str,
-#     pt_state: PTState,
-#     thetas_prop: np.ndarray,     # (C,W,D)
-#     lp_prop: np.ndarray,         # (C,W)
-#     betas: np.ndarray,           # (C,)
-#     log_qcorr: np.ndarray,       # (C,W)
-#     move_mask: np.ndarray,       # (C,W)
-# ) -> PTState:
-#     accept = mh_accept_tempered(rng, pt_state.log_probs, lp_prop, betas, log_qcorr, move_mask)
-#     # Record every move (accepted or not), per (c,w)
-#     C, W = accept.shape
-#     for c in range(C):
-#         for w in range(W):
-#             event_log.mh_events.append(
-#                 MHEvent(t_abs=t_abs, dt=dt, c=c, w=w, slot=slot_j,
-#                         move_type=move_type, accepted=bool(accept[c, w]))
-#             )
-#     # Update state (Gibbs-like — only accepted apply)
-#     th_new = np.where(accept[:, :, None], thetas_prop, pt_state.thetas)
-#     lp_new = np.where(accept, lp_prop, pt_state.log_probs)
-#     return PTState(thetas=th_new, log_probs=lp_new)
-
-
-# # =============================================================================
-# #                            NumPy PT-swap (even/odd)
-# # =============================================================================
-
-# def pt_swap_pass_numpy(
-#     rng: np.random.Generator,
-#     state: PTState,
-#     betas: np.ndarray,
-#     even_pass: bool,
-# ) -> Tuple[PTState, np.ndarray, np.ndarray]:
-#     thetas, lps = state.thetas, state.log_probs
-#     C, W, D = thetas.shape
-#     start = 0 if even_pass else 1
-#     idx_low  = np.arange(start, C-1, 2, dtype=np.int32)
-#     idx_high = idx_low + 1
-
-#     bi, bj = betas[idx_low], betas[idx_high]         # (P,), (P,)
-#     li = lps[idx_low, :]                             # (P,W)
-#     lj = lps[idx_high, :]                            # (P,W)
-#     delta = (bi - bj)[:, None] * (lj - li)           # (P,W)
-#     log_u = np.log(rng.random(delta.shape))
-#     accept_pairs = log_u < np.minimum(0.0, delta)    # (P,W) bool
-
-#     th = thetas.copy()
-#     lp = lps.copy()
-#     for p in range(idx_low.shape[0]):
-#         i = idx_low[p]; j = idx_high[p]
-#         mask = accept_pairs[p]            # (W,)
-#         mask_wd = mask[:, None]
-#         thi, thj = th[i].copy(), th[j].copy()
-#         lpi, lpj = lp[i].copy(), lp[j].copy()
-#         th[i] = np.where(mask_wd, thj, thi)
-#         th[j] = np.where(mask_wd, thi, thj)
-#         lp[i] = np.where(mask, lpj, lpi)
-#         lp[j] = np.where(mask, lpi, lpj)
-
-#     # attempted mask: mark both temps of every considered pair True
-#     att_mask = np.zeros((C, W), dtype=bool)
-#     for p in range(idx_low.shape[0]):
-#         i = idx_low[p]; j = idx_high[p]
-#         att_mask[i, :] = True
-#         att_mask[j, :] = True
-
-#     # acceptance mask: mark pairs where swap accepted
-#     acc_mask = np.zeros((C, W), dtype=bool)
-#     for p in range(idx_low.shape[0]):
-#         i = idx_low[p]; j = idx_high[p]
-#         acc_mask[i] |= accept_pairs[p]
-#         acc_mask[j] |= accept_pairs[p]
-
-#     return PTState(thetas=th, log_probs=lp), acc_mask, att_mask
-
-
-# # =============================================================================
-# #                   One MH Gibbs sweep over active slots (NumPy)
-# # =============================================================================
-
-# def gibbs_mh_sweep_active(
-#     rng_np: np.random.Generator,
-#     rng_jax: JaxKeySeq,
-#     *,
-#     t_abs: float,
-#     dt: float,
-#     pt_state: PTState,                 # (C,W,D), (C,W)
-#     ps_state: PSState,                 # provides active mask per slot
-#     slot_slices: Tuple,                # len Kmax; slice or bool mask over D per φ_j
-#     betas: np.ndarray,                 # (C,)
-#     # JAX batched likelihood
-#     batched_loglik: Callable[[np.ndarray], np.ndarray],
-#     # RW resources
-#     Ls: Optional[np.ndarray] = None,   # (C,D,D)
-#     U: Optional[np.ndarray] = None,    # (C,D,D)
-#     S: Optional[np.ndarray] = None,    # (C,D)
-#     # knobs
-#     do_stretch: bool = True,
-#     do_rw_fullcov: bool = True,
-#     do_rw_eigenline: bool = False,
-#     do_rw_student_t: bool = False,
-#     do_de: bool = True,
-#     stretch_a: float = 1.3,
-#     cross_rate: float = 0.7,
-#     gamma_de: float = 2.38,
-#     # logging
-#     event_log: Optional[EventLog] = None,
-# ) -> PTState:
-#     C, W, D = pt_state.thetas.shape
-#     thetas = pt_state.thetas
-#     lps    = pt_state.log_probs
-
-#     # Gibbs over active slots
-#     Kmax = ps_state.m.shape[-1]
-#     for j in range(Kmax):
-#         move_mask = ps_state.m[:, :, j].astype(bool)   # (C,W)
-#         if not move_mask.any():
-#             # still record that proposals were attempted? We skip to save time.
-#             continue
-
-#         slot_sel = slot_slices[j]
-
-#         # === Stretch (two half-steps red/blue) ===
-#         if do_stretch:
-#             k_mask = rng_jax.next()
-#             k_p1   = rng_jax.next()
-#             k_z1   = rng_jax.next()
-#             k_p2   = rng_jax.next()
-#             k_z2   = rng_jax.next()
-#             prop_all, logJ, _ = propose_stretch_np(
-#                 (k_mask, k_p1, k_z1, k_p2, k_z2), thetas, move_mask, a=stretch_a
-#             )
-#             prop = restrict_slot(prop_all, thetas, slot_sel)
-#             lp_prop = batched_loglik(prop.reshape(-1, D)).reshape(C, W)
-#             log_qcorr = logJ  # stretch uses Jacobian term
-#             pt_state = apply_mh_and_record(
-#                 rng_np, event_log, t_abs, dt, j, "stretch",
-#                 PTState(thetas, lps),
-#                 prop, lp_prop, betas, log_qcorr, move_mask
-#             )
-#             thetas, lps = pt_state.thetas, pt_state.log_probs
-
-#         # === RW Full-cov ===
-#         if do_rw_fullcov and (Ls is not None):
-#             k_rw = rng_jax.next()
-#             prop_all = propose_rw_fullcov_np(k_rw, thetas, Ls)
-#             prop = restrict_slot(prop_all, thetas, slot_sel)
-#             lp_prop = batched_loglik(prop.reshape(-1, D)).reshape(C, W)
-#             log_qcorr = np.zeros_like(lps)
-#             pt_state = apply_mh_and_record(
-#                 rng_np, event_log, t_abs, dt, j, "rw_fullcov",
-#                 PTState(thetas, lps),
-#                 prop, lp_prop, betas, log_qcorr, move_mask
-#             )
-#             thetas, lps = pt_state.thetas, pt_state.log_probs
-
-#         # === RW Eigenline ===
-#         if do_rw_eigenline and (U is not None) and (S is not None):
-#             k_ax = rng_jax.next()
-#             k_no = rng_jax.next()
-#             prop_all = propose_rw_eigenline_np((k_ax, k_no), thetas, U, S)
-#             prop = restrict_slot(prop_all, thetas, slot_sel)
-#             lp_prop = batched_loglik(prop.reshape(-1, D)).reshape(C, W)
-#             log_qcorr = np.zeros_like(lps)
-#             pt_state = apply_mh_and_record(
-#                 rng_np, event_log, t_abs, dt, j, "rw_eigenline",
-#                 PTState(thetas, lps),
-#                 prop, lp_prop, betas, log_qcorr, move_mask
-#             )
-#             thetas, lps = pt_state.thetas, pt_state.log_probs
-
-#         # === RW Student-t ===
-#         if do_rw_student_t and (Ls is not None):
-#             k_no = rng_jax.next()
-#             k_ga = rng_jax.next()
-#             prop_all = propose_rw_student_t_np((k_no, k_ga), thetas, Ls, nu=5.0)
-#             prop = restrict_slot(prop_all, thetas, slot_sel)
-#             lp_prop = batched_loglik(prop.reshape(-1, D)).reshape(C, W)
-#             log_qcorr = np.zeros_like(lps)
-#             pt_state = apply_mh_and_record(
-#                 rng_np, event_log, t_abs, dt, j, "rw_student_t",
-#                 PTState(thetas, lps),
-#                 prop, lp_prop, betas, log_qcorr, move_mask
-#             )
-#             thetas, lps = pt_state.thetas, pt_state.log_probs
-
-#         # === DE two-point (partners restricted to move_mask) ===
-#         if do_de:
-#             kp = rng_jax.next()
-#             kg = rng_jax.next()
-#             prop_all, has_pair = propose_de_np((kp, kg), thetas, move_mask, cross_rate, gamma_de)
-#             # Where no partners, this is a no-op; but we still record (rejected) moves.
-#             prop = restrict_slot(prop_all, thetas, slot_sel)
-#             lp_prop = batched_loglik(prop.reshape(-1, D)).reshape(C, W)
-#             log_qcorr = np.zeros_like(lps)
-#             # Only walkers with pair are eligible; still, record attempts
-#             move_mask_eff = move_mask & has_pair
-#             pt_state = apply_mh_and_record(
-#                 rng_np, event_log, t_abs, dt, j, "de",
-#                 PTState(thetas, lps),
-#                 prop, lp_prop, betas, log_qcorr, move_mask_eff
-#             )
-#             thetas, lps = pt_state.thetas, pt_state.log_probs
-
-#     # === PT swaps (even + odd) ===
-#     pt_state, acc_e, att_e = pt_swap_pass_numpy(rng_np, pt_state, betas, even_pass=True)
-#     pt_state, acc_o, att_o = pt_swap_pass_numpy(rng_np, pt_state, betas, even_pass=False)
-#     acc_pt = acc_e | acc_o
-#     att_pt = att_e | att_o
-#     if event_log is not None:
-#         C, W = pt_state.thetas.shape[:2]
-#         for c in range(C):
-#             for w in range(W):
-#                 if att_pt[c, w]:
-#                     event_log.mh_events.append(
-#                         MHEvent(t_abs=t_abs, dt=dt, c=c, w=w, slot=-1,
-#                                 move_type="ptswap", accepted=bool(acc_pt[c, w]))
-#                     )
-#     return pt_state
-
-
-# # =============================================================================
-# #                         Main CTMC + MH epoch runner
-# # =============================================================================
-
-# def run_epoch_ct_numpy(
-#     *,
-#     # RNG
-#     seed_numpy: int,
-#     seed_jax: int,
-#     # initial states
-#     pt_init: PTState,
-#     ps_init: PSState,
-#     # time horizon
-#     T_end: float,
-#     # MH Poisson rate
-#     rho_mh: float,
-#     # product-space / likelihood bits (NumPy callables)
-#     betas: np.ndarray,                     # (C,)
-#     Kmax: int,
-#     qb_density: Callable[[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]], float],
-#     qb_eval_variant: Literal["child","parent"],
-#     log_prior_phi: Callable[[np.ndarray], float],
-#     log_pseudo_phi: Callable[[np.ndarray], float],
-#     log_lik_masked: Callable[[np.ndarray, np.ndarray, Optional[np.ndarray]], float],
-#     log_p_k: Callable[[int], float],
-#     sample_pseudo_phi: Callable[[], np.ndarray],
-#     # θ slot mapping (length Kmax): each element is a slice or a bool mask over D
-#     slot_slices: Tuple,
-#     # JAX batched likelihood
-#     log_prob_fn_single_jax: Callable[[jnp.ndarray], jnp.ndarray],
-#     # RW resources for MH
-#     Ls: Optional[np.ndarray] = None,       # (C,D,D)
-#     U: Optional[np.ndarray]  = None,       # (C,D,D)
-#     S: Optional[np.ndarray]  = None,       # (C,D)
-#     # MH knobs
-#     do_stretch: bool = True,
-#     do_rw_fullcov: bool = True,
-#     do_rw_eigenline: bool = False,
-#     do_rw_student_t: bool = False,
-#     do_de: bool = True,
-#     stretch_a: float = 1.3,
-#     cross_rate: float = 0.7,
-#     gamma_de: float = 2.38,
-# ) -> Tuple[PTState, PSState, EventLog]:
-#     """
-#     Hybrid CTMC runner:
-#       - Each (c,w) has its own BD clock with state-dependent rate.
-#       - Global MH Poisson clock with rate rho_mh.
-#       - At each MH tick: Gibbs over active slots (SM->RW->DE) and PT swaps.
-#       - Logs every BD event and every MH move (accepted or not).
-#     """
-#     rng_np  = np.random.default_rng(seed_numpy)
-#     rng_jax = JaxKeySeq(seed_jax)
-#     batched_loglik = make_batched_loglik(log_prob_fn_single_jax)
-
-#     C, W, D = pt_init.thetas.shape
-#     pt = PTState(np.array(pt_init.thetas, copy=True),
-#                  np.array(pt_init.log_probs, copy=True))
-#     ps = PSState(np.array(ps_init.phi, copy=True),
-#                  np.array(ps_init.m,   copy=True),
-#                  None if ps_init.rest is None else np.array(ps_init.rest, copy=True),
-#                  np.array(ps_init.logpi, copy=True))
-
-#     events = EventLog(bd_events=[], mh_events=[])
-
-#     # Initialize BD clocks: draw from Exp(lam_total(c,w)) per chain
-#     T_bd = np.full((C, W), np.inf, dtype=np.float64)  # absolute next BD times
-#     t = 0.0
-
-#     # helper to (re)draw one chain's next BD absolute time
-#     def redraw_bd_time_for(c: int, w: int, t0: float) -> None:
-#         _, _, lam_total = compute_bd_hazards_one_chain(
-#             ps.phi[c, w], ps.m[c, w], None if ps.rest is None else ps.rest[c, w],
-#             beta=float(betas[c]), qb_density=qb_density, qb_eval_variant=qb_eval_variant,
-#             log_prior_phi=log_prior_phi, log_pseudo_phi=log_pseudo_phi,
-#             log_lik_masked=log_lik_masked, log_p_k=log_p_k, Kmax=Kmax
-#         )
-#         if lam_total > 0.0 and np.isfinite(lam_total):
-#             T_bd[c, w] = t0 + rng_np.exponential(1.0 / lam_total)
-#         else:
-#             T_bd[c, w] = np.inf
-
-#     # initial draw
-#     for c in range(C):
-#         for w in range(W):
-#             redraw_bd_time_for(c, w, t)
-
-#     # main loop
-#     while t < T_end:
-#         # next MH tick
-#         tau_mh = rng_np.exponential(1.0 / rho_mh)
-#         t_next = t + tau_mh
-#         if t_next > T_end:
-#             tau_mh = T_end - t
-#             t_next = T_end
-
-#         # process BD events up to t_next
-#         # we process in chronological order by repeatedly picking the next (c,w) with min T_bd
-#         while True:
-#             # find next BD event time & chain
-#             idx_min = np.argmin(T_bd)  # flat
-#             c_min = int(idx_min // W)
-#             w_min = int(idx_min %  W)
-#             t_bd = T_bd[c_min, w_min]
-#             if t_bd >= t_next:
-#                 break  # no BD before MH tick
-
-#             # fire the BD event on (c_min, w_min)
-#             # First compute dt for logging
-#             dt_bd = t_bd - t
-#             ps, ev, lam_after = fire_one_bd_event_cw(
-#                 rng_np, ps, c_min, w_min,
-#                 beta=float(betas[c_min]),
-#                 qb_density=qb_density, qb_eval_variant=qb_eval_variant,
-#                 log_prior_phi=log_prior_phi, log_pseudo_phi=log_pseudo_phi,
-#                 log_lik_masked=log_lik_masked, log_p_k=log_p_k,
-#                 sample_pseudo_phi=sample_pseudo_phi,
-#                 Kmax=Kmax
-#             )
-#             if ev is not None:
-#                 ev.t_abs = t_bd
-#                 ev.dt = dt_bd
-#                 events.bd_events.append(ev)
-
-#             # Advance local time reference to this BD event
-#             t = t_bd
-
-#             # Resample next BD time for this chain from its new hazards
-#             redraw_bd_time_for(c_min, w_min, t)
-
-#         # At MH tick: do Gibbs MH over active slots + PT swaps
-#         pt = gibbs_mh_sweep_active(
-#             rng_np, rng_jax,
-#             t_abs=t_next, dt=tau_mh,
-#             pt_state=pt, ps_state=ps,
-#             slot_slices=slot_slices, betas=betas,
-#             batched_loglik=batched_loglik,
-#             Ls=Ls, U=U, S=S,
-#             do_stretch=do_stretch,
-#             do_rw_fullcov=do_rw_fullcov,
-#             do_rw_eigenline=do_rw_eigenline,
-#             do_rw_student_t=do_rw_student_t,
-#             do_de=do_de,
-#             stretch_a=stretch_a,
-#             cross_rate=cross_rate,
-#             gamma_de=gamma_de,
-#             event_log=events,
-#         )
-
-#         # After MH, reset all BD clocks (memoryless, hazards may have changed via θ)
-#         for c in range(C):
-#             for w in range(W):
-#                 redraw_bd_time_for(c, w, t_next)
-
-#         # advance global time to MH tick
-#         t = t_next
-
-#     return pt, ps, events
-
-
-
-
-
-
-
-# # # src/ptdamh/BD_MH_step_numpy.py
-
-# # from __future__ import annotations
-# # from dataclasses import dataclass
-# # from typing import Callable, Tuple, Literal, Optional
-
-# # import numpy as np
-# # import jax
-# # import jax.numpy as jnp
-# # from jax import random
-
-
-# # # ========= State containers =========
-# # # C- temperature W - walker D- parameter (dimension)
-# # @dataclass # for parallel tempering state
-# # class PTState:
-# #     thetas: np.ndarray      # (C,W,D)
-# #     log_probs: np.ndarray   # (C,W)
-
-
-# # @dataclass # product space state, 
-# # # Kmax - max number of components (sources)
-# # class PSState:
-# #     phi: np.ndarray         # (C,W,Kmax,d)
-# #     m: np.ndarray           # (C,W,Kmax) bool
-# #     rest: Optional[np.ndarray]   # (C,W,Drest) or None
-# #     logpi: np.ndarray       # (C,W)
-
-
-# # @dataclass  ## birth-death Process event storage
-# # class BDEvent:
-# #     dt: float
-# #     kind: int               # 0=birth,1=death
-# #     c: int
-# #     w: int
-# #     slot: int
-
-
-# # @dataclass ## Metropolis-Hastings Process event storage
-# # class MHEvent:
-# #     dt: float
-# #     c: int
-# #     w: int
-# #     slot: int
-# #     move_type: str          # "stretch","rw","de","ptswap"
-# #     accepted: bool
-
-
-# # @dataclass
-# # class EventLog:
-# #     bd_events: list[BDEvent]
-# #     mh_events: list[MHEvent]
-
-
-# # # ========= Hybrid likelihood wrapper =========
-# # def make_batched_loglik(log_prob_fn_single: Callable[[jnp.ndarray], jnp.ndarray]):
-# #     """Return a NumPy-friendly function evaluating batched loglik via JAX."""
-# #     fn = jax.jit(jax.vmap(log_prob_fn_single))
-# #     def batched(x_np: np.ndarray) -> np.ndarray:
-# #         return np.array(fn(jnp.array(x_np)))
-# #     return batched
-
-
-# # # ========= Birth–Death step =========
-# # def bd_event(
-# #     rng: np.random.Generator,
-# #     ps: PSState,
-# #     c: int,
-# #     w: int,
-# #     lam_on: np.ndarray,      # (Kmax,)
-# #     lam_off: np.ndarray,     # (Kmax,)
-# #     sample_pseudo_phi: Callable[[], np.ndarray],
-# #     recompute_logpi: Callable[[np.ndarray, np.ndarray], float],
-# # ) -> Tuple[PSState,BDEvent]:
-# #     """Fire one BD event for chain (c,w)."""
-# #     hazards = np.concatenate([lam_on, lam_off])
-# #     if hazards.sum() <= 0:
-# #         # no event
-# #         return ps, None
-
-# #     idx = rng.choice(len(hazards), p=hazards/hazards.sum())
-# #     chosen_is_on = idx < lam_on.shape[0]
-# #     slot = idx if chosen_is_on else idx - lam_on.shape[0]
-
-# #     phi_new = ps.phi.copy()
-# #     m_new   = ps.m.copy()
-# #     logpi_new = ps.logpi.copy()
-
-# #     if chosen_is_on:   # birth
-# #         m_new[c,w,slot] = True
-# #     else:              # death
-# #         m_new[c,w,slot] = False
-# #         phi_new[c,w,slot,:] = sample_pseudo_phi()
-# #     # recompute logpi for that (c,w)
-# #     logpi_new[c,w] = recompute_logpi(phi_new[c,w], m_new[c,w])
-
-# #     new_state = PSState(phi=phi_new, m=m_new, rest=ps.rest, logpi=logpi_new)
-# #     ev = BDEvent(dt=0.0, kind=int(not chosen_is_on), c=c, w=w, slot=slot)
-# #     return new_state, ev
-
-
-# # # ========= MH Gibbs sweep =========
-# # def gibbs_mh_sweep(
-# #     rng: np.random.Generator,
-# #     pt: PTState,
-# #     ps: PSState,
-# #     slot_slices: list,
-# #     betas: np.ndarray,
-# #     batched_loglik: Callable[[np.ndarray], np.ndarray],
-# #     *,
-# #     stretch_fn, rw_fn, de_fn, pt_swap_fn,
-# #     event_log: EventLog,
-# #     dt: float,
-# # ) -> Tuple[PTState,PSState]:
-# #     """Perform Gibbs cycle over active φ_j. Every proposal recorded."""
-# #     C,W,D = pt.thetas.shape
-
-# #     for j, sl in enumerate(slot_slices):
-# #         move_mask = ps.m[:,:,j]   # (C,W)
-
-# #         # --- Stretch
-# #         if stretch_fn is not None:
-# #             prop, logJ, partner_mask = stretch_fn(rng, pt.thetas, move_mask)
-# #             lp_prop = batched_loglik(prop.reshape(-1,D)).reshape(C,W)
-# #             accept = accept_mh(rng, pt.log_probs, lp_prop, betas, logJ, move_mask)
-# #             pt, ps = update_states(pt, ps, prop, lp_prop, accept)
-# #             record_events(event_log, accept, "stretch", dt, j)
-
-# #         # --- RW
-# #         if rw_fn is not None:
-# #             prop = rw_fn(rng, pt.thetas, move_mask)
-# #             lp_prop = batched_loglik(prop.reshape(-1,D)).reshape(C,W)
-# #             accept = accept_mh(rng, pt.log_probs, lp_prop, betas, 0.0, move_mask)
-# #             pt, ps = update_states(pt, ps, prop, lp_prop, accept)
-# #             record_events(event_log, accept, "rw", dt, j)
-
-# #         # --- DE
-# #         if de_fn is not None:
-# #             prop = de_fn(rng, pt.thetas, move_mask)
-# #             lp_prop = batched_loglik(prop.reshape(-1,D)).reshape(C,W)
-# #             accept = accept_mh(rng, pt.log_probs, lp_prop, betas, 0.0, move_mask)
-# #             pt, ps = update_states(pt, ps, prop, lp_prop, accept)
-# #             record_events(event_log, accept, "de", dt, j)
-
-# #     # --- PT swap
-# #     if pt_swap_fn is not None:
-# #         pt_new, acc_mask, att_mask = pt_swap_fn(rng, pt, betas, even_pass=True)
-# #         # record swap events
-# #         for c in range(C):
-# #             for w in range(W):
-# #                 if att_mask[c,w]:
-# #                     ev = MHEvent(dt=dt, c=c, w=w, slot=-1,
-# #                                  move_type="ptswap", accepted=bool(acc_mask[c,w]))
-# #                     event_log.mh_events.append(ev)
-# #         pt = pt_new
-# #     return pt, ps
-
-
-# # # ========= MH helpers =========
-# # def accept_mh(rng, lp_cur, lp_prop, betas, logJ, mask):
-# #     """MH accept for tempered likelihoods."""
-# #     log_alpha = (lp_prop - lp_cur) * betas[:,None] + logJ
-# #     u = np.log(rng.random(lp_cur.shape))
-# #     return (u < np.minimum(0.0, log_alpha)) & mask
-
-# # def update_states(pt, ps, prop, lp_prop, accept):
-# #     th_new = np.where(accept[:,:,None], prop, pt.thetas)
-# #     lp_new = np.where(accept, lp_prop, pt.log_probs)
-# #     pt = PTState(thetas=th_new, log_probs=lp_new)
-# #     ps = ps  # unchanged for MH moves
-# #     return pt, ps
-
-# # def record_events(event_log, accept, move_type, dt, slot):
-# #     C,W = accept.shape
-# #     for c in range(C):
-# #         for w in range(W):
-# #             if accept[c,w] or True:  # record every move
-# #                 ev = MHEvent(dt=dt, c=c, w=w, slot=slot,
-# #                              move_type=move_type, accepted=bool(accept[c,w]))
-# #                 event_log.mh_events.append(ev)
-
-
-# # # ========= Main runner =========
-# # def run_epoch_ct(
-# #     rng: np.random.Generator,
-# #     pt_init: PTState,
-# #     ps_init: PSState,
-# #     *,
-# #     T_end: float,
-# #     rho_mh: float,
-# #     slot_slices: list,
-# #     betas: np.ndarray,
-# #     batched_loglik: Callable[[np.ndarray], np.ndarray],
-# #     stretch_fn=None, rw_fn=None, de_fn=None, pt_swap_fn=None,
-# # ) -> Tuple[PTState,PSState,EventLog]:
-
-# #     t = 0.0
-# #     pt, ps = pt_init, ps_init
-# #     event_log = EventLog(bd_events=[], mh_events=[])
-
-# #     # initialise BD clocks
-# #     C,W,D = pt.thetas.shape
-# #     T_bd = np.full((C,W), np.inf)
-
-# #     while t < T_end:
-# #         # next MH tick
-# #         tau_mh = np.random.exponential(1.0/rho_mh)
-# #         t_next = t + tau_mh
-
-# #         # process BD events up to t_next
-# #         for c in range(C):
-# #             for w in range(W):
-# #                 while T_bd[c,w] < t_next:
-# #                     ps, ev = bd_event(rng, ps, c,w,
-# #                         lam_on=np.ones(slot_slices.__len__()),   # placeholder
-# #                         lam_off=np.ones(slot_slices.__len__()),  # placeholder
-# #                         sample_pseudo_phi=lambda: rng.random(D),
-# #                         recompute_logpi=lambda phi_cw,m_cw: 0.0
-# #                     )
-# #                     if ev is not None:
-# #                         ev.dt = T_bd[c,w]-t
-# #                         event_log.bd_events.append(ev)
-# #                     # resample next BD time
-# #                     T_bd[c,w] += np.random.exponential(1.0)
-
-# #         # at MH tick: do Gibbs sweep + PT swap
-# #         pt, ps = gibbs_mh_sweep(
-# #             rng, pt, ps, slot_slices, betas, batched_loglik,
-# #             stretch_fn=stretch_fn, rw_fn=rw_fn, de_fn=de_fn,
-# #             pt_swap_fn=pt_swap_fn,
-# #             event_log=event_log, dt=tau_mh
-# #         )
-
-# #         # reset BD clocks after MH
-# #         T_bd = np.random.exponential(1.0, size=(C,W)) + t_next
-
-# #         t = t_next
-
-# #     return pt, ps, event_log
+# =============================================================================
+#                               End of file
+# =============================================================================
+
+# For validation of log-likelihood of the state:
+# def validate_ll_snapshot(batched_ll_masked, phi_sel, m_sel, rest_sel, ll_sel, temp_index):
+#     phi_c = phi_sel[temp_index]   # (W,Kmax,d)
+#     m_c   = m_sel[temp_index]     # (W,Kmax)
+#     rest_c = None if rest_sel is None else rest_sel[temp_index]
+#     ll_re = batched_ll_masked(phi_c, m_c, rest_c)      # (W,)
+#     ll_st = ll_sel[temp_index]                          # (W,)
+#     diff = np.abs(ll_re - ll_st)
+#     return diff.max(), diff
