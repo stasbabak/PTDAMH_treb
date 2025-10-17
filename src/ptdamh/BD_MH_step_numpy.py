@@ -544,7 +544,7 @@ def ps_swap_pass_inplace(
 
     for p in range(idx_low.shape[0]):
         i = idx_low[p]; j = idx_high[p]
-        mask_w = accept_pairs[i]             # (W,) booleans for walkers at this pair
+        mask_w = accept_pairs[i] | accept_pairs[j]            # (W,) booleans for walkers at this pair
         if not mask_w.any():
             continue
         # swap (φ, m, rest, logπ) at (i,<mask_w>) <-> (j,<mask_w>)
@@ -1509,17 +1509,18 @@ def run_epoch_ct_numpy(
         idxs = np.argwhere(~ps.m)  # (n_inactive, 3) over (c,w,slot)
         for c_i, w_i, j_i in idxs:
             ps.phi[c_i, w_i, j_i, :] = sample_pseudo_phi()
-    _, _, lam_total, _ = compute_bd_hazards_all(
-        ps, betas,
-        qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
-        log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
-        log_p_k_np=log_p_k_np,
-        batched_loglik_masked=batched_ll_masked,  bd_rate_scale=bd_rate_scale
-    )
     T_bd = np.full((C, W), np.inf, dtype=np.float64)
-    with np.errstate(divide='ignore'):
-        mask_pos = lam_total > 0.0
-        T_bd[mask_pos] = rng.exponential(1.0 / lam_total[mask_pos])
+    if DO_BD:
+        _, _, lam_total, _ = compute_bd_hazards_all(
+            ps, betas,
+            qb_density_np=qb_density_np, qb_eval_variant=qb_eval_variant,
+            log_prior_phi_np=log_prior_phi_np, log_pseudo_phi_np=log_pseudo_phi_np,
+            log_p_k_np=log_p_k_np,
+            batched_loglik_masked=batched_ll_masked,  bd_rate_scale=bd_rate_scale
+        )
+        with np.errstate(divide='ignore'):
+            mask_pos = lam_total > 0.0
+            T_bd[mask_pos] = rng.exponential(1.0 / lam_total[mask_pos])
     # absolute next times
     t = 0.0
     T_bd = T_bd + t
